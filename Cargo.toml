@@ -1,0 +1,20 @@
+[package]
+name = "rust-pipeline"
+version = "0.1.0"
+edition = "2021"
+description = "Self-feeding async pipeline with adversarial validation — spiritual successor to xml-pipeline"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+thiserror = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
