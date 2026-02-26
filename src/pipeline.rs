@@ -343,8 +343,37 @@ async fn dispatch_stage(
 
         match result {
             Ok(HandlerResponse::None) => {
-                debug!(handler = %msg.target_name, "handler returned None (terminal)");
-                // Thread ends here — no re-injection
+                // Synthesize ACK if a parent exists in the thread chain
+                let mut threads = threads.lock().await;
+                match threads.prune_for_response(&msg.envelope.meta.thread) {
+                    Some(prune) => {
+                        debug!(
+                            handler = %msg.target_name,
+                            target = %prune.target,
+                            "None → synthesized ACK for parent"
+                        );
+
+                        let ack_payload = b"<ToolResponse><success>true</success><result>ack</result></ToolResponse>";
+                        match build_envelope(
+                            &msg.target_name,
+                            &prune.target,
+                            &prune.thread_id,
+                            ack_payload,
+                        ) {
+                            Ok(raw) => {
+                                if reinject_tx.send(raw).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("failed to build ACK envelope: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        debug!(handler = %msg.target_name, "handler returned None (terminal, no parent)");
+                    }
+                }
             }
             Ok(HandlerResponse::Reply { payload_xml }) => {
                 // Prune chain and route back to caller
@@ -466,6 +495,108 @@ mod tests {
 
         // Give stages time to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn none_with_parent_synthesizes_ack() {
+        // Parent handler forwards to child, child returns None.
+        // Pipeline should synthesize ACK back to parent.
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_clone = call_count.clone();
+
+        // Parent: first call → Send to child; second call → record ACK
+        let parent = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let r = received_clone.clone();
+            let cc = call_count_clone.clone();
+            Box::pin(async move {
+                let mut count = cc.lock().await;
+                *count += 1;
+                if *count == 1 {
+                    // First call: forward to child
+                    Ok(HandlerResponse::Send {
+                        to: "child".into(),
+                        payload_xml: b"<ChildRequest><data>go</data></ChildRequest>".to_vec(),
+                    })
+                } else {
+                    // Subsequent call: record what we received (should be ACK)
+                    let text = String::from_utf8_lossy(&p.xml).to_string();
+                    r.lock().await.push(text);
+                    Ok(HandlerResponse::None)
+                }
+            })
+        });
+
+        // Child: always returns None
+        let child = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("parent", "ParentRequest", parent, false, vec!["child".into()], "Parent", None);
+        // Register ToolResponse route so ACK replies route back to parent
+        registry.routing.register("parent", "ToolResponse", false, vec!["child".into()], "Parent");
+        registry.register("child", "ChildRequest", child, false, vec![], "Child", None);
+
+        let threads = ThreadRegistry::new();
+        let mut pipeline = Pipeline::new(registry, threads);
+        pipeline.run();
+
+        let envelope = build_envelope(
+            "test-sender",
+            "parent",
+            "thread-ack-1",
+            b"<ParentRequest><task>do it</task></ParentRequest>",
+        )
+        .unwrap();
+
+        pipeline.inject(envelope).await.unwrap();
+
+        // Wait for processing (parent→child→ACK→parent)
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let msgs = received.lock().await;
+        assert_eq!(msgs.len(), 1, "parent should receive exactly one ACK");
+        assert!(msgs[0].contains("ToolResponse"), "ACK should be a ToolResponse");
+        assert!(msgs[0].contains("ack"), "ACK should contain 'ack'");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn none_at_root_stays_silent() {
+        // Handler returns None with no parent — thread ends silently
+        let mut registry = ListenerRegistry::new();
+        let threads = ThreadRegistry::new();
+
+        let sink = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        registry.register("sink", "SinkRequest", sink, false, vec![], "Sink", None);
+
+        let mut pipeline = Pipeline::new(registry, threads);
+        pipeline.run();
+
+        let envelope = build_envelope(
+            "test-sender",
+            "sink",
+            "thread-silent-1",
+            b"<SinkRequest><data>gone</data></SinkRequest>",
+        )
+        .unwrap();
+
+        pipeline.inject(envelope).await.unwrap();
+
+        // Wait — should not crash or hang
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         pipeline.shutdown().await;
     }

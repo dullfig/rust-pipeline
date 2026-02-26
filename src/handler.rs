@@ -60,8 +60,11 @@ pub enum HandlerResponse {
         payload_xml: Vec<u8>,
     },
 
-    /// No response — this handler is a terminal sink.
-    /// The thread chain ends here.
+    /// No response — this handler has nothing to say.
+    /// If a parent exists in the thread chain, the pipeline synthesizes
+    /// an ACK (`<ToolResponse><success>true</success><result>ack</result></ToolResponse>`)
+    /// and routes it back so the parent doesn't hang in AwaitingTools.
+    /// If no parent exists (chain exhausted), the thread ends silently.
     None,
 }
 
