@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::envelope::{build_envelope, parse_envelope, AgentId, Envelope};
 use crate::error::PipelineError;
 use crate::handler::{HandlerContext, HandlerResponse, ValidatedPayload};
+use crate::middleware::{DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict};
 use crate::registry::ListenerRegistry;
 use crate::thread::ThreadRegistry;
 
@@ -42,6 +43,9 @@ pub struct Pipeline {
 
     /// Thread registry (shared, behind a mutex for safe mutation).
     threads: Arc<Mutex<ThreadRegistry>>,
+
+    /// Middleware chain — run before/after handler dispatch.
+    middleware: Vec<Arc<dyn Middleware>>,
 
     /// Shutdown signal.
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -82,9 +86,19 @@ impl Pipeline {
             ingress_tx,
             registry: Arc::new(registry),
             threads: Arc::new(Mutex::new(threads)),
+            middleware: Vec::new(),
             shutdown_tx: None,
             handles: Vec::new(),
         }
+    }
+
+    /// Add middleware to the dispatch chain.
+    ///
+    /// Middleware runs in registration order for pre-dispatch,
+    /// and reverse order for post-dispatch (onion wrapping).
+    /// Must be called before `run()`.
+    pub fn add_middleware(&mut self, mw: impl Middleware) {
+        self.middleware.push(Arc::new(mw));
     }
 
     /// Start the pipeline stages as tokio tasks.
@@ -133,11 +147,13 @@ impl Pipeline {
 
         // ── Stage 4: Dispatch + Reinject ─────────────────────────────
         // RoutedMsg → call handler → serialize response → reinject
+        let middleware: Arc<Vec<Arc<dyn Middleware>>> = Arc::new(self.middleware.drain(..).collect());
         let h4 = tokio::spawn(dispatch_stage(
             routed_rx,
             reinject_tx,
             registry3,
             threads2,
+            middleware,
         ));
 
         self.handles = vec![h1, h2, h3, h4];
@@ -322,6 +338,7 @@ async fn dispatch_stage(
     reinject_tx: mpsc::Sender<Vec<u8>>,
     registry: Arc<ListenerRegistry>,
     threads: Arc<Mutex<ThreadRegistry>>,
+    middleware: Arc<Vec<Arc<dyn Middleware>>>,
 ) {
     while let Some(msg) = rx.recv().await {
         let handler = match registry.get_handler(&msg.target_name) {
@@ -338,8 +355,76 @@ async fn dispatch_stage(
             own_name: msg.target_name.clone(),
         };
 
-        // Call handler
-        let result = handler.handle(msg.payload, ctx).await;
+        // Build dispatch metadata for middleware
+        let meta = DispatchMeta {
+            from: msg.envelope.meta.from.clone(),
+            to: msg.target_name.clone(),
+            thread_id: msg.envelope.meta.thread.clone(),
+            payload_tag: msg.payload.tag.clone(),
+        };
+
+        // Pre-dispatch middleware chain (in registration order)
+        let mut short_circuited = None;
+        for mw in middleware.iter() {
+            match mw.pre_dispatch(&meta, &msg.payload).await {
+                Ok(PreDispatchVerdict::Continue) => {}
+                Ok(PreDispatchVerdict::ShortCircuit(response)) => {
+                    debug!(
+                        handler = %msg.target_name,
+                        "middleware short-circuited dispatch"
+                    );
+                    short_circuited = Some(Ok(response));
+                    break;
+                }
+                Err(e) => {
+                    short_circuited = Some(Err(e));
+                    break;
+                }
+            }
+        }
+
+        // Call handler (unless short-circuited)
+        let result = if let Some(r) = short_circuited {
+            r
+        } else {
+            handler.handle(msg.payload.clone(), ctx).await
+        };
+
+        // Post-dispatch middleware chain (in reverse order)
+        let result = match result {
+            Ok(response) => {
+                let mut current = Some(response);
+                for mw in middleware.iter().rev() {
+                    let r = current.take().expect("post-dispatch: response consumed");
+                    match mw.post_dispatch(&meta, &msg.payload, r).await {
+                        Ok(PostDispatchVerdict::PassThrough(r)) => current = Some(r),
+                        Ok(PostDispatchVerdict::Replace(r)) => {
+                            debug!(
+                                handler = %msg.target_name,
+                                "middleware replaced response"
+                            );
+                            current = Some(r);
+                        }
+                        Err(e) => {
+                            error!(
+                                handler = %msg.target_name,
+                                "middleware post-dispatch error: {e}"
+                            );
+                            // On middleware error, fall through to dispatch error
+                            current = None;
+                            break;
+                        }
+                    }
+                }
+                match current {
+                    Some(r) => Ok(r),
+                    None => Err(PipelineError::Handler(
+                        "middleware post-dispatch error".into(),
+                    )),
+                }
+            }
+            Err(e) => Err(e),
+        };
 
         match result {
             Ok(HandlerResponse::None) => {
@@ -453,6 +538,7 @@ async fn dispatch_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use crate::handler::FnHandler;
 
     /// Build a minimal test pipeline with an echo handler.
@@ -642,6 +728,185 @@ mod tests {
         let msgs = received.lock().await;
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("hello"));
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn middleware_pre_dispatch_short_circuit() {
+        // Middleware short-circuits: handler should NOT be called.
+        let handler_called = Arc::new(Mutex::new(false));
+        let handler_called_clone = handler_called.clone();
+
+        let sink = FnHandler(move |_p: ValidatedPayload, _ctx: HandlerContext| {
+            let called = handler_called_clone.clone();
+            Box::pin(async move {
+                *called.lock().await = true;
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("sink", "Greeting", sink, false, vec![], "Sink", None);
+        let threads = ThreadRegistry::new();
+
+        let mut pipeline = Pipeline::new(registry, threads);
+
+        // Short-circuit middleware: always blocks
+        struct BlockAll;
+        #[async_trait]
+        impl Middleware for BlockAll {
+            async fn pre_dispatch(
+                &self,
+                _meta: &DispatchMeta,
+                _payload: &ValidatedPayload,
+            ) -> Result<PreDispatchVerdict, PipelineError> {
+                Ok(PreDispatchVerdict::ShortCircuit(HandlerResponse::None))
+            }
+        }
+        pipeline.add_middleware(BlockAll);
+        pipeline.run();
+
+        let envelope = build_envelope(
+            "test-sender",
+            "sink",
+            "thread-mw-1",
+            b"<Greeting><text>hi</text></Greeting>",
+        )
+        .unwrap();
+
+        pipeline.inject(envelope).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(!*handler_called.lock().await, "handler should not be called when middleware short-circuits");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn middleware_post_dispatch_replace() {
+        // Handler returns None, middleware replaces with Reply.
+        // We verify the replacement by having a parent receive the reply.
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_clone = call_count.clone();
+
+        // Parent: first call → Send to child; second call → record response
+        let parent = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let r = received_clone.clone();
+            let cc = call_count_clone.clone();
+            Box::pin(async move {
+                let mut count = cc.lock().await;
+                *count += 1;
+                if *count == 1 {
+                    Ok(HandlerResponse::Send {
+                        to: "child".into(),
+                        payload_xml: b"<ChildRequest><data>go</data></ChildRequest>".to_vec(),
+                    })
+                } else {
+                    let text = String::from_utf8_lossy(&p.xml).to_string();
+                    r.lock().await.push(text);
+                    Ok(HandlerResponse::None)
+                }
+            })
+        });
+
+        // Child: returns None (middleware will replace with Reply)
+        let child = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register(
+            "parent", "ParentRequest", parent, false, vec!["child".into()], "Parent", None,
+        );
+        registry.routing.register("parent", "ToolResponse", false, vec!["child".into()], "Parent");
+        registry.register("child", "ChildRequest", child, false, vec![], "Child", None);
+
+        let threads = ThreadRegistry::new();
+        let mut pipeline = Pipeline::new(registry, threads);
+
+        // Middleware that replaces None with Reply for child handler
+        struct ReplaceNone;
+        #[async_trait]
+        impl Middleware for ReplaceNone {
+            async fn post_dispatch(
+                &self,
+                meta: &DispatchMeta,
+                _payload: &ValidatedPayload,
+                response: HandlerResponse,
+            ) -> Result<PostDispatchVerdict, PipelineError> {
+                if meta.to == "child" {
+                    if matches!(response, HandlerResponse::None) {
+                        return Ok(PostDispatchVerdict::Replace(HandlerResponse::Reply {
+                            payload_xml: b"<ToolResponse><success>true</success><result>replaced</result></ToolResponse>".to_vec(),
+                        }));
+                    }
+                }
+                Ok(PostDispatchVerdict::PassThrough(response))
+            }
+        }
+        pipeline.add_middleware(ReplaceNone);
+        pipeline.run();
+
+        let envelope = build_envelope(
+            "test-sender",
+            "parent",
+            "thread-mw-2",
+            b"<ParentRequest><task>do it</task></ParentRequest>",
+        )
+        .unwrap();
+
+        pipeline.inject(envelope).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let msgs = received.lock().await;
+        assert_eq!(msgs.len(), 1, "parent should receive middleware-replaced response");
+        assert!(msgs[0].contains("replaced"), "response should contain middleware replacement");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn empty_middleware_vec_no_effect() {
+        // Pipeline with no middleware should work exactly as before.
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+
+        let sink = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let r = received_clone.clone();
+            Box::pin(async move {
+                let text = String::from_utf8_lossy(&p.xml).to_string();
+                r.lock().await.push(text);
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("sink", "Greeting", sink, false, vec![], "Sink", None);
+        let threads = ThreadRegistry::new();
+
+        let mut pipeline = Pipeline::new(registry, threads);
+        // No middleware added — empty vec
+        pipeline.run();
+
+        let envelope = build_envelope(
+            "test-sender",
+            "sink",
+            "thread-mw-3",
+            b"<Greeting><text>works</text></Greeting>",
+        )
+        .unwrap();
+
+        pipeline.inject(envelope).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let msgs = received.lock().await;
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("works"));
 
         pipeline.shutdown().await;
     }

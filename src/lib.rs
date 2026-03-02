@@ -57,6 +57,7 @@ pub mod config;
 pub mod envelope;
 pub mod error;
 pub mod handler;
+pub mod middleware;
 pub mod pipeline;
 pub mod registry;
 pub mod routing;
@@ -70,6 +71,9 @@ pub mod prelude {
     pub use crate::error::{PipelineError, PipelineResult};
     pub use crate::handler::{
         FnHandler, Handler, HandlerContext, HandlerResponse, HandlerResult, ValidatedPayload,
+    };
+    pub use crate::middleware::{
+        DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict,
     };
     pub use crate::pipeline::Pipeline;
     pub use crate::registry::ListenerRegistry;
