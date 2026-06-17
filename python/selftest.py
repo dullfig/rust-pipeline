@@ -91,8 +91,42 @@ def main() -> None:
     except ValueError:
         pass
 
+    # 4. FederationServer.receive: re-roots a forged origin + authorizer fails closed.
+    delivered = []
+
+    def deny_ringhub_to_root(frm, to):
+        return not (frm.node() == "ringhub" and to.node() == "root")
+
+    server = fed.FederationServer(
+        "agentos", d, lambda _e, _f: None, delivered.append, authorize=deny_ringhub_to_root
+    )
+
+    # ringhub forges `from: root.admin` to a normal target → re-rooted, delivered.
+    forged = fed.Envelope(
+        fed.Meta(fed.Address.parse("root.admin"),
+                 fed.Address.parse("agentos.concierge[alice]"), "t", 0),
+        fed.Payload.single("X", "a", "b"),
+    )
+    server.receive(fed.seal(forged, "ringhub", KEY))
+    assert str(delivered[-1].meta.from_) == "ringhub.admin", "origin must re-root to peer"
+    assert delivered[-1].meta.from_.node() == "ringhub"
+
+    # ringhub tries to reach root.* → blocked, fail-closed.
+    esc = fed.Envelope(
+        fed.Meta(fed.Address.parse("ringhub.cart"),
+                 fed.Address.parse("root.coding-expert[x]"), "t", 0),
+        fed.Payload.single("X", "a", "b"),
+    )
+    try:
+        server.receive(fed.seal(esc, "ringhub", KEY))
+        raise SystemExit("FAIL: ringhub->root was not blocked")
+    except ValueError:
+        pass
+    assert len(delivered) == 1, "blocked message must not deliver"
+
     print("SELFTEST OK")
-    print("  Python round-trip, frozen real Rust frame, wrong-key + tamper rejection.")
+    print("  Python round-trip, frozen real Rust frame, wrong-key + tamper rejection,")
+    print("  receive re-roots forged origin + authorizer fail-closed.")
 
 
 if __name__ == "__main__":

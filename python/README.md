@@ -38,7 +38,12 @@ directory.register(fed.Peer("agentos", "https://agentos.local/fed", AGENTOS_KEY,
 def transport_send(endpoint, frame):  ...   # POST frame to endpoint, or a websocket, etc.
 def local_deliver(envelope):          ...   # hand to Django
 
-server = fed.FederationServer("ringhub", directory, transport_send, local_deliver)
+# Optional authorize(from, to) -> bool is your `from x to` namespace matrix
+# (re-homes check_namespace). Keys on Address.node() (leading segment). None = allow all.
+def authorize(frm, to):
+    return not (frm.node() != "ringhub" and to.node() == "root")  # e.g. nobody reaches root
+
+server = fed.FederationServer("ringhub", directory, transport_send, local_deliver, authorize)
 
 # Outbound: address an AgentOS agent; the leading segment is the node.
 env = fed.Envelope(
@@ -50,8 +55,9 @@ env = fed.Envelope(
 server.send(env)            # seals with RingHub's identity + AgentOS's key, transmits
 
 # Inbound: when a sealed frame arrives over your transport:
-server.receive(frame_bytes)  # authenticates sender, stamps edge provenance,
-                             # strips the "ringhub" prefix, calls local_deliver
+server.receive(frame_bytes)  # authenticates sender, RE-ROOTS `from` to the authenticated
+                             # peer (unforgeable origin), stamps edge provenance, runs
+                             # authorize (fail-closed), strips self-prefix, calls local_deliver
 ```
 
 Build richer payloads with `fed.PayloadValue` (`rec`, `seq`, `text`, `uint`, `sint`,

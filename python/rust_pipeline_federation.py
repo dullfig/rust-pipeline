@@ -112,6 +112,12 @@ class Address:
     def namespace(self) -> Optional[str]:
         return self.segments[0].name if self._org_idx() > 0 else None
 
+    def node(self) -> Optional[str]:
+        # The federation node = the leading segment (reliable regardless of organism keys).
+        # Authz matrices key on this, not namespace(). On a re-rooted inbound `from` it is
+        # the authenticated peer.
+        return self.segments[0].name if self.segments else None
+
     def instance_key(self) -> Optional[str]:
         i = self._org_idx()
         return self.segments[i].key if i < len(self.segments) else None
@@ -395,20 +401,37 @@ class PeerDirectory:
         return namespace in self._peers
 
 
+def _reroot_origin(from_addr: Address, namespace: str) -> Address:
+    """Overwrite `from`'s leading namespace with the authenticated peer `namespace`.
+
+    Makes origin unforgeable: a peer names which of its agents sent the message, never
+    which namespace. Mirrors rust-pipeline's reroot_origin. Convention: leading segment is
+    the namespace/node, so >=2 segments replace the claimed namespace; a bare agent is
+    prefixed.
+    """
+    head = Segment(namespace)
+    rest = from_addr.segments[1:] if len(from_addr.segments) >= 2 else from_addr.segments
+    return Address([head, *rest])
+
+
 class FederationServer:
     """Thin node-boundary server. Inject your transport (send sealed bytes to a peer
-    endpoint) and local delivery (hand an opened envelope to your app — e.g. Django).
+    endpoint), local delivery (hand an opened envelope to your app — e.g. Django), and an
+    optional authorize(from, to) callable (the `from x to` matrix; None = allow all).
 
-        server = FederationServer("ringhub", directory, my_send, my_handle)
-        server.send(env)        # outbound: leading address segment = peer node → seal+transmit
-        server.receive(frame)   # inbound: open → stamp edge provenance → strip self-ns → deliver
+        server = FederationServer("ringhub", directory, my_send, my_handle, my_authorize)
+        server.send(env)        # outbound: leading address segment = peer node -> seal+transmit
+        server.receive(frame)   # inbound: open -> re-root origin -> stamp provenance ->
+                                #          authorize -> strip self-ns -> deliver
     """
 
-    def __init__(self, node: str, directory: PeerDirectory, transport_send, local_deliver):
+    def __init__(self, node: str, directory: PeerDirectory, transport_send, local_deliver,
+                 authorize=None):
         self.node = node
         self.directory = directory
         self._send = transport_send      # (endpoint: str, frame: bytes) -> None
         self._deliver = local_deliver    # (envelope: Envelope) -> None
+        self._authorize = authorize      # (from: Address, to: Address) -> bool; None = allow all
 
     def send(self, envelope: Envelope) -> None:
         to = envelope.meta.to
@@ -422,10 +445,21 @@ class FederationServer:
 
     def receive(self, frame: bytes) -> None:
         env, sender = open_frame(frame, self.directory)
+
+        # Unforgeable origin: re-root `from` to the authenticated peer (overwrites any
+        # namespace the sender claimed — they can never assert another node's namespace).
+        env.meta.from_ = _reroot_origin(env.meta.from_, sender)
+
         peer = self.directory.get(sender)
         if peer is not None and peer.inbound_provenance:
             env.meta.provenance |= peer.inbound_provenance
+
+        # Authorize from x to (re-homed check_namespace), before stripping. Fail-closed.
+        if self._authorize is not None and env.meta.to is not None:
+            if not self._authorize(env.meta.from_, env.meta.to):
+                raise ValueError(f"unauthorized: {env.meta.from_} -> {env.meta.to}")
+
         to = env.meta.to
         if to is not None and len(to.segments) > 1 and to.segments[0].name == self.node:
-            to.segments = to.segments[1:]  # strip our own node prefix → locally routable
+            to.segments = to.segments[1:]  # strip our own node prefix -> locally routable
         self._deliver(env)
