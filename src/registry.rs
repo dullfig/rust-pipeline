@@ -149,7 +149,7 @@ mod tests {
     impl crate::handler::Handler for EchoHandler {
         async fn handle(&self, payload: ValidatedPayload, _ctx: HandlerContext) -> HandlerResult {
             Ok(HandlerResponse::Reply {
-                payload_xml: payload.xml,
+                payload: payload.to_payload(),
             })
         }
     }

@@ -1,0 +1,84 @@
+// Canonical wire types for rust-pipeline — the ONE envelope, shared by intra-instance
+// hops, inter-pipeline (switchboard) delivery, and (later) federation.
+//
+// SOURCE OF TRUTH for the envelope shape. src/wire.rs is the Rust projection; the
+// `wire_wit_matches_rust_types` test pins the two together so they can't silently drift.
+//
+// ⚠ NOT directly wit-bindgen-generable as written. `payload-value` is RECURSIVE
+// (`seq(list<payload-value>)`; `field` contains `payload-value`), and the WebAssembly
+// Component Model type system FORBIDS recursive types. A self-describing tree is
+// fundamentally not a component-model type, so this variant is documentation here and is
+// hand-authored in src/wire.rs. (It also reinforces the Commit-2 decision: the binary
+// codec must be a self-describing serde format — cbor/msgpack — NOT the component ABI.)
+// The non-recursive header types (segment/address/provenance/meta/payload/envelope) ARE
+// component-model-clean and could be wit-bindgen-generated later if desired.
+//
+// Serialization (XML now via quick-xml, binary codec later) is INTERNAL to
+// rust-pipeline. agentos consumes the typed value through the crate dependency, never
+// raw bytes (the encapsulation rider). Dependency direction: agentos -> rust-pipeline.
+
+package rust-pipeline:wire@0.1.0;
+
+interface wire {
+    /// One segment of a hierarchical address: a name + optional instance key.
+    /// Cache-composition (`bob[main+alice]`) lives inside `key` as a `+`-joined
+    /// string; a `cache-keys` accessor splits it. A bare name with `key: none` is
+    /// the degenerate flat case that replaces today's `from: string`/`to: string`.
+    record segment {
+        name: string,        // [a-zA-Z0-9_-]+
+        key: option<string>, // instance key, e.g. "alice" or "main+alice"; none = singleton
+    }
+
+    /// Hierarchical agent address. "ringhub.bob[alice].calendar" -> 3 segments.
+    /// Flat single-listener routing is a one-segment address with no key.
+    record address {
+        segments: list<segment>,
+    }
+
+    /// Opaque provenance label-set. SET semantics: union = bitwise OR, egress test =
+    /// mask AND. rust-pipeline CARRIES and UNIONS; it NEVER interprets a bit. agentos
+    /// owns the bit->meaning map out of band. Deliberately a neutral bitset, NOT WIT
+    /// `flags` (which would force naming members = policy in rust-pipeline). 128 bits;
+    /// widen to a list<u64> if outgrown.
+    record provenance {
+        bits-lo: u64,
+        bits-hi: u64,
+    }
+
+    /// Trust-relevant header.
+    record meta {
+        from: address,          // last hop. ROUTING/AUDIT ONLY — no enforcement reads it.
+        to: option<address>,    // none = unrouted/broadcast.
+        thread: string,         // opaque conversation/thread id (UUID today).
+        provenance: provenance, // durable origin set; unioned into every envelope built downstream.
+    }
+
+    /// Self-describing, format-agnostic decoded payload value. Lets the pipeline stay
+    /// generic over per-operation schemas while keeping codec details out of agentos.
+    /// (Case names avoid WIT keywords: rec/seq/text/uint/sint/real/boolean/blob/nil.)
+    variant payload-value {
+        rec(list<field>),
+        seq(list<payload-value>),
+        text(string),
+        uint(u64),
+        sint(s64),
+        real(f64),
+        boolean(bool),
+        blob(list<u8>),
+        nil,
+    }
+    record field { name: string, value: payload-value }
+
+    /// A typed, tagged payload. `tag` selects the operation/schema; `value` is the
+    /// DECODED, schema-validated content — never raw wire bytes at the handler boundary.
+    record payload {
+        tag: string,
+        value: payload-value,
+    }
+
+    /// The one canonical envelope.
+    record envelope {
+        meta: meta,
+        payload: payload,
+    }
+}
