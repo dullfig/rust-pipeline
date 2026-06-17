@@ -249,6 +249,42 @@ Each layer asks the question it owns: transport → "did the bytes land," pipeli
 
 **Idempotency (since at-least-once retry guarantees duplicates):** agentos already has a battle-tested idempotency cache (`crates/server/src/idempotency.rs`) — but it covers the **HTTP `POST /v1/messages` API only** (keyed on `service_token + client idempotency_key`, body-hash conflict, 24h TTL, replay/in-flight). The **federation edge does NOT pass through it.** The federation path needs its **own** dedup, modeled on that cache, keyed on **(peer namespace, federation msg-id)** — where the msg-id is the per-message id in the **payload/host layer** (consistent with "no msg-id on the envelope"; `thread` is per-*conversation*). RingHub stamps it; agentos dedups before `switchboard.route`. Host policy, both ends.
 
+### 7.4 Origin namespace is an unforgeable edge stamp (re-homes `check_namespace`)
+
+**A message does not get to assert its own namespace — the edge stamps it.** When a frame
+arrives from authenticated peer `ringhub`, its origin namespace is `ringhub` *because of
+which authenticated edge it arrived on*, not because the payload said so. Self-asserted
+origin is the last-hop bug wearing a namespace costume (cf. §16.0 provenance, §17 consent):
+origin is rooted, upstream, unforgeable.
+
+This is the sibling of the provenance edge-stamp — same seam, same per-peer config, same
+reason (the sender must not forge its origin):
+- `inbound_provenance` → origin **data** label.
+- origin **namespace** (the authenticated peer identity) → origin **authority/identity** label.
+
+**Two parts — mechanism in rust-pipeline, policy in the host:**
+1. **Stamp (mechanism, rust-pipeline):** `FederationServer::receive` calls `reroot_origin` to
+   overwrite `from`'s leading namespace segment with the authenticated peer's. A peer can
+   name *which of its agents* sent the message, never *which namespace*. ⇒ **`root` is
+   structurally unstampable by any remote edge** — a remote `from` is *always* the peer
+   namespace, so `root.*` can only be minted by local, in-process trusted entry points
+   (operator, local trigger, local switchboard). That asymmetry **is** the tenant/admin
+   isolation wall (§4.3 — a wall, not a sieve: there is no code path by which a ringhub-edged
+   frame becomes `root`).
+2. **Authorize (hook, host policy):** rust-pipeline exposes an `Authorizer { authorize(from, to) }`
+   trait, called at the seam **after** stamping, **before** delivery, **fail-closed**. The
+   *rule* (the `from × to` matrix — e.g. "a namespaced remote origin may never reach `root`")
+   is the host's; the *seam* is rust-pipeline's. This **re-homes the deleted platform
+   `check_namespace`** — into the federation authz seam, where the agentos session's
+   intuition put it.
+
+**Receive order:** `open` (authenticate) → **re-root `from`** → stamp provenance →
+**`authorize(from, to)`** (on the still-namespaced `to`) → strip self-namespace → deliver.
+
+**Authz keys on `Address::node()`** (the leading segment = federation node), **not**
+`namespace()` (the organism-key heuristic for *local* instance addressing, unreliable for
+`node.agent` without a key). On a re-rooted inbound `from`, `node()` is the authenticated peer.
+
 ---
 
 ## 8. Routing topology — route vs. dispatch, and the hierarchical resolver

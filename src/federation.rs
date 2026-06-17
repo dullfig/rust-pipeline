@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 
 use crate::codec::{decode_envelope, encode_envelope};
 use crate::error::PipelineError;
-use crate::wire::{Envelope, Provenance};
+use crate::wire::{Address, Envelope, Provenance, Segment};
 
 /// A 256-bit symmetric key for a peer link, hand-delivered out of band.
 pub type PeerKey = [u8; 32];
@@ -95,9 +95,53 @@ pub enum FederationError {
     /// Local delivery of an inbound envelope failed.
     #[error("local delivery error: {0}")]
     Delivery(String),
+    /// The authorizer rejected this origin→target crossing (fail-closed).
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
     /// Envelope encode/decode failed.
     #[error(transparent)]
     Codec(#[from] PipelineError),
+}
+
+/// Re-root an inbound `from` address onto the authenticated peer `namespace`, overwriting
+/// whatever namespace the sender claimed. This is what makes origin **unforgeable**: a peer
+/// can claim *which of its agents* sent the message, but not *which namespace* — it can
+/// never assert `root` (or any namespace but its own) on the front.
+///
+/// Convention (federation): the leading segment is the namespace/node. So with ≥2 segments
+/// the claimed leading namespace is replaced; a bare single-segment agent is prefixed.
+fn reroot_origin(from: &Address, namespace: &str) -> Address {
+    let mut segments = vec![Segment {
+        name: namespace.to_string(),
+        key: None,
+    }];
+    if from.segments.len() >= 2 {
+        segments.extend_from_slice(&from.segments[1..]); // drop the claimed namespace
+    } else {
+        segments.extend_from_slice(&from.segments); // bare agent → prefix
+    }
+    Address { segments }
+}
+
+/// Authorization at the federation seam: given the **edge-stamped, unforgeable** origin
+/// `from` and the target `to`, may this crossing proceed?
+///
+/// This re-homes the old platform `check_namespace` matrix. The *rule* is the host's (the
+/// tenant/namespace matrix — e.g. "a namespaced remote origin may never reach the `root`
+/// namespace"); the *seam* — a guaranteed call, post-stamp, pre-delivery, that fails closed
+/// on rejection — is rust-pipeline's. Mechanism here, policy in the host.
+pub trait Authorizer: Send + Sync {
+    fn authorize(&self, from: &Address, to: &Address) -> Result<(), String>;
+}
+
+/// An authorizer that permits everything — for local/trusted setups and tests. Federation
+/// deployments inject a real matrix instead.
+pub struct AllowAll;
+
+impl Authorizer for AllowAll {
+    fn authorize(&self, _from: &Address, _to: &Address) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Encode the authenticated header: `version ‖ auth_method ‖ sender_len ‖ sender`.
@@ -280,17 +324,26 @@ pub struct FederationServer<T: Transport, D: LocalDelivery> {
     directory: PeerDirectory,
     transport: T,
     local: D,
+    authorizer: Box<dyn Authorizer>,
 }
 
 impl<T: Transport, D: LocalDelivery> FederationServer<T, D> {
     /// Create a federation server for this `node` (its namespace = the sender identity
-    /// stamped on outbound frames).
-    pub fn new(node: impl Into<String>, directory: PeerDirectory, transport: T, local: D) -> Self {
+    /// stamped on outbound frames). `authorizer` gates inbound origin→target crossings —
+    /// use [`AllowAll`] for local/trusted setups, a real matrix for federation.
+    pub fn new(
+        node: impl Into<String>,
+        directory: PeerDirectory,
+        transport: T,
+        local: D,
+        authorizer: impl Authorizer + 'static,
+    ) -> Self {
         Self {
             node: node.into(),
             directory,
             transport,
             local,
+            authorizer: Box::new(authorizer),
         }
     }
 
@@ -333,6 +386,12 @@ impl<T: Transport, D: LocalDelivery> FederationServer<T, D> {
     pub async fn receive(&self, frame: &[u8]) -> Result<(), FederationError> {
         let (mut envelope, sender) = open(frame, &self.directory)?;
 
+        // UNFORGEABLE ORIGIN: stamp `from`'s namespace from the authenticated peer
+        // identity, overwriting any namespace the sender claimed. A peer can name *which
+        // of its agents* sent this, never *which namespace* — `root` is structurally
+        // unstampable by a remote edge. (Sibling of the provenance stamp below.)
+        envelope.meta.from = reroot_origin(&envelope.meta.from, &sender);
+
         // Edge provenance stamp (host-configured per peer).
         let edge = self
             .directory
@@ -340,6 +399,14 @@ impl<T: Transport, D: LocalDelivery> FederationServer<T, D> {
             .map(|p| p.inbound_provenance)
             .unwrap_or(Provenance::EMPTY);
         envelope.meta.provenance.union_with(edge);
+
+        // AUTHORIZE: from × to, against the host's matrix (re-homed check_namespace). `from`
+        // is now the unforgeable stamped origin; `to` still carries its namespace. Fail-closed.
+        if let Some(to) = envelope.meta.to.as_ref() {
+            self.authorizer
+                .authorize(&envelope.meta.from, to)
+                .map_err(FederationError::Unauthorized)?;
+        }
 
         // Strip our own node prefix so the switchboard sees a local address:
         // `agentos.concierge[alice]` received at node `agentos` → `concierge[alice]`.
@@ -528,7 +595,8 @@ mod tests {
 
         let mut dir = PeerDirectory::new();
         dir.register(peer("ringhub", key, 10));
-        let server = FederationServer::new("agentos", dir, transport, RecordingSink::default());
+        let server =
+            FederationServer::new("agentos", dir, transport, RecordingSink::default(), AllowAll);
 
         // Address a message to ringhub.bob[alice] — leading segment "ringhub" is the node.
         let env = Envelope {
@@ -558,6 +626,7 @@ mod tests {
             PeerDirectory::new(),
             RecordingTransport::default(),
             RecordingSink::default(),
+            AllowAll,
         );
         let env = Envelope {
             meta: Meta {
@@ -595,13 +664,16 @@ mod tests {
         dir.register(peer("ringhub", key, 10));
         let sink = RecordingSink::default();
         let delivered = sink.delivered.clone();
-        let server = FederationServer::new("agentos", dir, RecordingTransport::default(), sink);
+        let server =
+            FederationServer::new("agentos", dir, RecordingTransport::default(), sink, AllowAll);
 
         server.receive(&frame).await.unwrap();
 
         let delivered = delivered.lock().await;
         assert_eq!(delivered.len(), 1);
         let env = &delivered[0];
+        // Origin re-rooted to the authenticated peer namespace (here unchanged).
+        assert_eq!(env.meta.from.to_string(), "ringhub.bob");
         // Self-namespace stripped → locally routable.
         assert_eq!(env.meta.to.as_ref().unwrap().to_string(), "concierge[alice]");
         assert_eq!(env.meta.to.as_ref().unwrap().organism(), Some("concierge"));
@@ -618,10 +690,87 @@ mod tests {
             PeerDirectory::new(), // ringhub not registered
             RecordingTransport::default(),
             RecordingSink::default(),
+            AllowAll,
         );
         assert!(matches!(
             server.receive(&frame).await,
             Err(FederationError::UnknownPeer(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn receive_reroots_forged_origin_namespace() {
+        // A compromised peer forges `from: root.evil` to claim admin authority.
+        let key: PeerKey = [44u8; 32];
+        let forged = Envelope {
+            meta: Meta {
+                from: Address::parse("root.evil").unwrap(), // lie
+                to: Some(Address::parse("agentos.concierge[alice]").unwrap()),
+                thread: "t".into(),
+                provenance: Provenance::EMPTY,
+            },
+            payload: WirePayload::single("X", "a", "b"),
+        };
+        let frame = seal(&forged, "ringhub", &key).unwrap();
+
+        let mut dir = PeerDirectory::new();
+        dir.register(peer("ringhub", key, 0));
+        let sink = RecordingSink::default();
+        let delivered = sink.delivered.clone();
+        let server =
+            FederationServer::new("agentos", dir, RecordingTransport::default(), sink, AllowAll);
+
+        server.receive(&frame).await.unwrap();
+
+        // The forged `root` namespace is overwritten with the authenticated peer's.
+        let env = &delivered.lock().await[0];
+        assert_eq!(env.meta.from.to_string(), "ringhub.evil");
+        assert_eq!(env.meta.from.node(), Some("ringhub"));
+        assert_ne!(env.meta.from.node(), Some("root"));
+    }
+
+    #[tokio::test]
+    async fn receive_blocked_by_authorizer_delivers_nothing() {
+        // A matrix that forbids the `ringhub` origin from reaching the `root` namespace.
+        struct NoRinghubToRoot;
+        impl Authorizer for NoRinghubToRoot {
+            fn authorize(&self, from: &Address, to: &Address) -> Result<(), String> {
+                // Federation authz keys on the node (leading segment), not namespace().
+                if from.node() == Some("ringhub") && to.node() == Some("root") {
+                    Err("ringhub may not reach root".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let key: PeerKey = [55u8; 32];
+        // ringhub tries to reach root.coding-expert (escalation).
+        let env = Envelope {
+            meta: Meta {
+                from: Address::parse("ringhub.cart").unwrap(),
+                to: Some(Address::parse("root.coding-expert[x]").unwrap()),
+                thread: "t".into(),
+                provenance: Provenance::EMPTY,
+            },
+            payload: WirePayload::single("X", "a", "b"),
+        };
+        let frame = seal(&env, "ringhub", &key).unwrap();
+
+        let mut dir = PeerDirectory::new();
+        dir.register(peer("ringhub", key, 0));
+        let sink = RecordingSink::default();
+        let delivered = sink.delivered.clone();
+        let server = FederationServer::new(
+            "agentos",
+            dir,
+            RecordingTransport::default(),
+            sink,
+            NoRinghubToRoot,
+        );
+
+        let err = server.receive(&frame).await.unwrap_err();
+        assert!(matches!(err, FederationError::Unauthorized(_)));
+        assert!(delivered.lock().await.is_empty(), "blocked → nothing delivered");
     }
 }

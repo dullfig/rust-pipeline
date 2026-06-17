@@ -83,8 +83,8 @@ pub mod prelude {
     pub use crate::envelope::{AgentId, ThreadId, ENVELOPE_NS};
     pub use crate::error::{PipelineError, PipelineResult};
     pub use crate::federation::{
-        open, seal, FederationEgress, FederationError, FederationServer, LocalDelivery, Peer,
-        PeerDirectory, PeerKey, Transport,
+        open, seal, AllowAll, Authorizer, FederationEgress, FederationError, FederationServer,
+        LocalDelivery, Peer, PeerDirectory, PeerKey, Transport,
     };
     pub use crate::wire::{
         Address, Envelope, Field, Meta, Payload, PayloadValue, Provenance, Segment,

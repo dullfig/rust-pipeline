@@ -145,6 +145,18 @@ impl Address {
         (idx > 0).then(|| self.segments[0].name.as_str())
     }
 
+    /// The **node namespace** in the federation addressing model — the *leading* segment
+    /// (`ringhub.bob[alice]` → "ringhub", `root.coding-expert[x]` → "root").
+    ///
+    /// Distinct from [`Address::namespace`], which uses the organism-key heuristic for
+    /// *local* instance addressing and returns `None` when the organism has no key. For
+    /// **cross-node routing and authorization** the node is always the leading segment —
+    /// reliable regardless of keys, and on a re-rooted inbound `from` it is the
+    /// authenticated peer. Federation authz matrices should key on this.
+    pub fn node(&self) -> Option<&str> {
+        self.segments.first().map(|s| s.name.as_str())
+    }
+
     /// The instance key from the organism segment, if present (`bob[alice]` → "alice").
     pub fn instance_key(&self) -> Option<&str> {
         self.segments
