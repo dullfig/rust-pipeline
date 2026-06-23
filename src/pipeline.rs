@@ -19,12 +19,15 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
-use crate::envelope::{build_envelope, parse_envelope, AgentId, Envelope};
+use crate::codec::{decode_envelope, encode_envelope};
+use crate::envelope::AgentId;
 use crate::error::PipelineError;
+use crate::federation::FederationEgress;
 use crate::handler::{HandlerContext, HandlerResponse, ValidatedPayload};
 use crate::middleware::{DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict};
 use crate::registry::ListenerRegistry;
 use crate::thread::ThreadRegistry;
+use crate::wire::{Address, Envelope, Meta, Payload, PayloadValue};
 
 /// Channel buffer size for inter-stage communication.
 const CHANNEL_BUFFER: usize = 256;
@@ -52,6 +55,9 @@ pub struct Pipeline {
 
     /// Join handles for pipeline tasks.
     handles: Vec<tokio::task::JoinHandle<()>>,
+
+    /// Optional federation egress — remote-node destinations escalate here.
+    federation_egress: Option<FederationEgress>,
 }
 
 // ── Internal stage message types ─────────────────────────────────────
@@ -89,7 +95,15 @@ impl Pipeline {
             middleware: Vec::new(),
             shutdown_tx: None,
             handles: Vec::new(),
+            federation_egress: None,
         }
+    }
+
+    /// Install the federation-egress hook: messages addressed to a registered remote node
+    /// are handed to the federation server instead of being routed locally. Call before
+    /// `run()`.
+    pub fn with_federation(&mut self, egress: FederationEgress) {
+        self.federation_egress = Some(egress);
     }
 
     /// Add middleware to the dispatch chain.
@@ -143,6 +157,7 @@ impl Pipeline {
             routed_tx,
             registry2,
             threads,
+            self.federation_egress.clone(),
         ));
 
         // ── Stage 4: Dispatch + Reinject ─────────────────────────────
@@ -210,13 +225,13 @@ async fn parse_stage(
     loop {
         tokio::select! {
             Some(raw) = rx.recv() => {
-                match parse_envelope(&raw) {
+                match decode_envelope(&raw) {
                     Ok(envelope) => {
                         debug!(
                             from = %envelope.meta.from,
                             to = ?envelope.meta.to,
                             thread = %envelope.meta.thread,
-                            payload = %envelope.payload_tag,
+                            payload = %envelope.payload.tag,
                             "parsed envelope"
                         );
                         if tx.send(ParsedMsg { envelope }).await.is_err() {
@@ -244,16 +259,15 @@ async fn validate_stage(
     registry: Arc<ListenerRegistry>,
 ) {
     while let Some(msg) = rx.recv().await {
-        let tag = &msg.envelope.payload_tag;
-        let payload_xml = &msg.envelope.payload_raw;
+        let tag = msg.envelope.payload.tag.clone();
 
-        match registry.schemas.validate(tag, payload_xml) {
+        match registry.schemas.validate_value(&tag, &msg.envelope.payload.value) {
             Ok(()) => {
                 debug!(tag = %tag, "payload validated");
                 let validated = ValidatedMsg {
                     payload: ValidatedPayload {
-                        xml: msg.envelope.payload_raw.clone(),
-                        tag: msg.envelope.payload_tag.clone(),
+                        tag,
+                        value: msg.envelope.payload.value.clone(),
                     },
                     envelope: msg.envelope,
                 };
@@ -275,10 +289,35 @@ async fn route_stage(
     tx: mpsc::Sender<RoutedMsg>,
     registry: Arc<ListenerRegistry>,
     threads: Arc<Mutex<ThreadRegistry>>,
+    federation: Option<FederationEgress>,
 ) {
     while let Some(msg) = rx.recv().await {
-        let to = msg.envelope.meta.to.as_deref();
-        let tag = &msg.envelope.payload_tag;
+        // Federation egress: a destination whose leading segment is a registered remote
+        // node leaves via the federation server, not local routing (resolve-or-escalate).
+        if let Some(fed) = &federation {
+            let is_remote = msg
+                .envelope
+                .meta
+                .to
+                .as_ref()
+                .and_then(|a| a.segments.first())
+                .map(|s| fed.directory.is_remote(&s.name))
+                .unwrap_or(false);
+            if is_remote {
+                debug!(to = ?msg.envelope.meta.to, "federation egress → remote node");
+                if fed.tx.send(msg.envelope).await.is_err() {
+                    warn!("federation egress channel closed");
+                }
+                continue;
+            }
+        }
+
+        // Route to the organism segment — the listener. (Namespace/key/buffer are
+        // instance-level concerns resolved above the pipeline; the listener is shared.)
+        let to = msg.envelope.meta.to.as_ref().and_then(|a| a.organism());
+        let tag = &msg.envelope.payload.tag;
+        // `from` for routing/peer/thread purposes is the sender's organism (listener).
+        let from_name = msg.envelope.meta.from.organism().unwrap_or_default().to_string();
 
         // Resolve route
         let entries = match registry.routing.resolve(to, tag) {
@@ -293,10 +332,7 @@ async fn route_stage(
         let target = &entries[0];
 
         // Enforce peer constraints
-        if let Err(e) = registry
-            .routing
-            .enforce_peers(&msg.envelope.meta.from, &target.name)
-        {
+        if let Err(e) = registry.routing.enforce_peers(&from_name, &target.name) {
             warn!("{e}");
             continue; // Message dies — peer violation
         }
@@ -306,11 +342,7 @@ async fn route_stage(
             let mut threads = threads.lock().await;
             let thread_id = &msg.envelope.meta.thread;
             if threads.lookup(thread_id).is_none() {
-                threads.register_thread(
-                    thread_id,
-                    &msg.envelope.meta.from,
-                    &target.name,
-                );
+                threads.register_thread(thread_id, &from_name, &target.name);
             }
         }
 
@@ -352,22 +384,32 @@ async fn dispatch_stage(
         let ctx = HandlerContext {
             thread_id: msg.envelope.meta.thread.clone(),
             from: msg.envelope.meta.from.clone(),
-            own_name: msg.target_name.clone(),
+            own_name: Address::flat(&msg.target_name),
+            provenance: msg.envelope.meta.provenance,
         };
 
-        // Build dispatch metadata for middleware
+        // Build dispatch metadata for middleware (name-keyed)
         let meta = DispatchMeta {
-            from: msg.envelope.meta.from.clone(),
+            from: msg.envelope.meta.from.organism().unwrap_or_default().to_string(),
             to: msg.target_name.clone(),
             thread_id: msg.envelope.meta.thread.clone(),
             payload_tag: msg.payload.tag.clone(),
         };
 
         // Pre-dispatch middleware chain (in registration order)
+        // Payload may be transformed in-flight by middleware.
+        let mut payload = msg.payload.clone();
         let mut short_circuited = None;
         for mw in middleware.iter() {
-            match mw.pre_dispatch(&meta, &msg.payload).await {
+            match mw.pre_dispatch(&meta, &payload).await {
                 Ok(PreDispatchVerdict::Continue) => {}
+                Ok(PreDispatchVerdict::Transform(new_payload)) => {
+                    debug!(
+                        handler = %msg.target_name,
+                        "middleware transformed payload"
+                    );
+                    payload = new_payload;
+                }
                 Ok(PreDispatchVerdict::ShortCircuit(response)) => {
                     debug!(
                         handler = %msg.target_name,
@@ -387,7 +429,7 @@ async fn dispatch_stage(
         let result = if let Some(r) = short_circuited {
             r
         } else {
-            handler.handle(msg.payload.clone(), ctx).await
+            handler.handle(payload.clone(), ctx).await
         };
 
         // Post-dispatch middleware chain (in reverse order)
@@ -396,7 +438,7 @@ async fn dispatch_stage(
                 let mut current = Some(response);
                 for mw in middleware.iter().rev() {
                     let r = current.take().expect("post-dispatch: response consumed");
-                    match mw.post_dispatch(&meta, &msg.payload, r).await {
+                    match mw.post_dispatch(&meta, &payload, r).await {
                         Ok(PostDispatchVerdict::PassThrough(r)) => current = Some(r),
                         Ok(PostDispatchVerdict::Replace(r)) => {
                             debug!(
@@ -426,6 +468,11 @@ async fn dispatch_stage(
             Err(e) => Err(e),
         };
 
+        // Provenance is CARRIED from the inbound envelope into whatever the dispatcher
+        // builds (Provenance is Copy). In Commit 1 nothing stamps new bits, so the union
+        // is just propagation; §step-4 proves it accumulates across a multi-hop chain.
+        let inbound_prov = msg.envelope.meta.provenance;
+
         match result {
             Ok(HandlerResponse::None) => {
                 // Synthesize ACK if a parent exists in the thread chain
@@ -438,21 +485,29 @@ async fn dispatch_stage(
                             "None → synthesized ACK for parent"
                         );
 
-                        let ack_payload = b"<ToolResponse><success>true</success><result>ack</result></ToolResponse>";
-                        match build_envelope(
-                            &msg.target_name,
-                            &prune.target,
-                            &prune.thread_id,
-                            ack_payload,
-                        ) {
+                        let ack = Payload::new(
+                            "ToolResponse",
+                            PayloadValue::record([
+                                ("success", PayloadValue::Boolean(true)),
+                                ("result", PayloadValue::text("ack")),
+                            ]),
+                        );
+                        let env = Envelope {
+                            meta: Meta {
+                                from: Address::flat(&msg.target_name),
+                                to: Some(Address::flat(&prune.target)),
+                                thread: prune.thread_id.clone(),
+                                provenance: inbound_prov,
+                            },
+                            payload: ack,
+                        };
+                        match encode_envelope(&env) {
                             Ok(raw) => {
                                 if reinject_tx.send(raw).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                error!("failed to build ACK envelope: {e}");
-                            }
+                            Err(e) => error!("failed to build ACK envelope: {e}"),
                         }
                     }
                     None => {
@@ -460,7 +515,7 @@ async fn dispatch_stage(
                     }
                 }
             }
-            Ok(HandlerResponse::Reply { payload_xml }) => {
+            Ok(HandlerResponse::Reply { payload }) => {
                 // Prune chain and route back to caller
                 let mut threads = threads.lock().await;
                 match threads.prune_for_response(&msg.envelope.meta.thread) {
@@ -472,20 +527,22 @@ async fn dispatch_stage(
                         );
 
                         // Build envelope and serialize to raw bytes (UNTRUSTED)
-                        match build_envelope(
-                            &msg.target_name,
-                            &prune.target,
-                            &prune.thread_id,
-                            &payload_xml,
-                        ) {
+                        let env = Envelope {
+                            meta: Meta {
+                                from: Address::flat(&msg.target_name),
+                                to: Some(Address::flat(&prune.target)),
+                                thread: prune.thread_id.clone(),
+                                provenance: inbound_prov,
+                            },
+                            payload,
+                        };
+                        match encode_envelope(&env) {
                             Ok(raw) => {
                                 if reinject_tx.send(raw).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(e) => {
-                                error!("failed to build reply envelope: {e}");
-                            }
+                            Err(e) => error!("failed to build reply envelope: {e}"),
                         }
                     }
                     None => {
@@ -496,18 +553,19 @@ async fn dispatch_stage(
                     }
                 }
             }
-            Ok(HandlerResponse::Send { to, payload_xml }) => {
-                // Forward to named target — extend chain
+            Ok(HandlerResponse::Send { to, payload }) => {
+                // Forward to a target — extend chain (route by organism = listener)
+                let to_name = to.organism().unwrap_or_default().to_string();
                 let new_thread = {
                     let mut threads = threads.lock().await;
 
                     // Enforce peer constraints
-                    if let Err(e) = registry.routing.enforce_peers(&msg.target_name, &to) {
+                    if let Err(e) = registry.routing.enforce_peers(&msg.target_name, &to_name) {
                         warn!("{e}");
                         continue;
                     }
 
-                    threads.extend_chain(&msg.envelope.meta.thread, &to)
+                    threads.extend_chain(&msg.envelope.meta.thread, &to_name)
                 };
 
                 debug!(
@@ -517,15 +575,22 @@ async fn dispatch_stage(
                 );
 
                 // Build envelope and serialize to raw bytes (UNTRUSTED)
-                match build_envelope(&msg.target_name, &to, &new_thread, &payload_xml) {
+                let env = Envelope {
+                    meta: Meta {
+                        from: Address::flat(&msg.target_name),
+                        to: Some(to),
+                        thread: new_thread,
+                        provenance: inbound_prov,
+                    },
+                    payload,
+                };
+                match encode_envelope(&env) {
                     Ok(raw) => {
                         if reinject_tx.send(raw).await.is_err() {
                             break;
                         }
                     }
-                    Err(e) => {
-                        error!("failed to build send envelope: {e}");
-                    }
+                    Err(e) => error!("failed to build send envelope: {e}"),
                 }
             }
             Err(e) => {
@@ -540,6 +605,31 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use crate::handler::FnHandler;
+    use crate::wire::Provenance;
+
+    /// Build inbound wire bytes for a message (the typed replacement for the old
+    /// `build_envelope` test helper).
+    fn inbound(from: &str, to: &str, thread: &str, payload: Payload) -> Vec<u8> {
+        encode_envelope(&Envelope {
+            meta: Meta {
+                from: from.into(),
+                to: Some(to.into()),
+                thread: thread.into(),
+                provenance: Provenance::EMPTY,
+            },
+            payload,
+        })
+        .unwrap()
+    }
+
+    /// The text of a payload's `text` field, or "" — the common assertion target.
+    fn text_of(p: &ValidatedPayload) -> String {
+        p.value
+            .get("text")
+            .and_then(|v| v.as_text())
+            .unwrap_or("")
+            .to_string()
+    }
 
     /// Build a minimal test pipeline with an echo handler.
     fn setup_echo_pipeline() -> Pipeline {
@@ -550,7 +640,7 @@ mod tests {
         let echo = FnHandler(|p: ValidatedPayload, _ctx: HandlerContext| {
             Box::pin(async move {
                 Ok(HandlerResponse::Reply {
-                    payload_xml: p.xml,
+                    payload: p.to_payload(),
                 }) as Result<HandlerResponse, PipelineError>
             })
         });
@@ -605,12 +695,17 @@ mod tests {
                     // First call: forward to child
                     Ok(HandlerResponse::Send {
                         to: "child".into(),
-                        payload_xml: b"<ChildRequest><data>go</data></ChildRequest>".to_vec(),
+                        payload: Payload::single("ChildRequest", "data", "go"),
                     })
                 } else {
                     // Subsequent call: record what we received (should be ACK)
-                    let text = String::from_utf8_lossy(&p.xml).to_string();
-                    r.lock().await.push(text);
+                    let result = p
+                        .value
+                        .get("result")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    r.lock().await.push(format!("{}:{}", p.tag, result));
                     Ok(HandlerResponse::None)
                 }
             })
@@ -633,15 +728,15 @@ mod tests {
         let mut pipeline = Pipeline::new(registry, threads);
         pipeline.run();
 
-        let envelope = build_envelope(
-            "test-sender",
-            "parent",
-            "thread-ack-1",
-            b"<ParentRequest><task>do it</task></ParentRequest>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "parent",
+                "thread-ack-1",
+                Payload::single("ParentRequest", "task", "do it"),
+            ))
+            .await
+            .unwrap();
 
         // Wait for processing (parent→child→ACK→parent)
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -671,15 +766,15 @@ mod tests {
         let mut pipeline = Pipeline::new(registry, threads);
         pipeline.run();
 
-        let envelope = build_envelope(
-            "test-sender",
-            "sink",
-            "thread-silent-1",
-            b"<SinkRequest><data>gone</data></SinkRequest>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "sink",
+                "thread-silent-1",
+                Payload::single("SinkRequest", "data", "gone"),
+            ))
+            .await
+            .unwrap();
 
         // Wait — should not crash or hang
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -700,8 +795,7 @@ mod tests {
         let sink = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
             let r = received_clone.clone();
             Box::pin(async move {
-                let text = String::from_utf8_lossy(&p.xml).to_string();
-                r.lock().await.push(text);
+                r.lock().await.push(text_of(&p));
                 Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
             })
         });
@@ -712,15 +806,15 @@ mod tests {
         pipeline.run();
 
         // Inject a message
-        let envelope = build_envelope(
-            "test-sender",
-            "sink",
-            "test-thread-001",
-            b"<Greeting><text>hello</text></Greeting>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "sink",
+                "test-thread-001",
+                Payload::single("Greeting", "text", "hello"),
+            ))
+            .await
+            .unwrap();
 
         // Wait for processing
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -767,15 +861,15 @@ mod tests {
         pipeline.add_middleware(BlockAll);
         pipeline.run();
 
-        let envelope = build_envelope(
-            "test-sender",
-            "sink",
-            "thread-mw-1",
-            b"<Greeting><text>hi</text></Greeting>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "sink",
+                "thread-mw-1",
+                Payload::single("Greeting", "text", "hi"),
+            ))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert!(!*handler_called.lock().await, "handler should not be called when middleware short-circuits");
@@ -802,11 +896,16 @@ mod tests {
                 if *count == 1 {
                     Ok(HandlerResponse::Send {
                         to: "child".into(),
-                        payload_xml: b"<ChildRequest><data>go</data></ChildRequest>".to_vec(),
+                        payload: Payload::single("ChildRequest", "data", "go"),
                     })
                 } else {
-                    let text = String::from_utf8_lossy(&p.xml).to_string();
-                    r.lock().await.push(text);
+                    let result = p
+                        .value
+                        .get("result")
+                        .and_then(|v| v.as_text())
+                        .unwrap_or("")
+                        .to_string();
+                    r.lock().await.push(result);
                     Ok(HandlerResponse::None)
                 }
             })
@@ -839,12 +938,16 @@ mod tests {
                 _payload: &ValidatedPayload,
                 response: HandlerResponse,
             ) -> Result<PostDispatchVerdict, PipelineError> {
-                if meta.to == "child" {
-                    if matches!(response, HandlerResponse::None) {
-                        return Ok(PostDispatchVerdict::Replace(HandlerResponse::Reply {
-                            payload_xml: b"<ToolResponse><success>true</success><result>replaced</result></ToolResponse>".to_vec(),
-                        }));
-                    }
+                if meta.to == "child" && matches!(response, HandlerResponse::None) {
+                    return Ok(PostDispatchVerdict::Replace(HandlerResponse::Reply {
+                        payload: Payload::new(
+                            "ToolResponse",
+                            PayloadValue::record([
+                                ("success", PayloadValue::Boolean(true)),
+                                ("result", PayloadValue::text("replaced")),
+                            ]),
+                        ),
+                    }));
                 }
                 Ok(PostDispatchVerdict::PassThrough(response))
             }
@@ -852,20 +955,81 @@ mod tests {
         pipeline.add_middleware(ReplaceNone);
         pipeline.run();
 
-        let envelope = build_envelope(
-            "test-sender",
-            "parent",
-            "thread-mw-2",
-            b"<ParentRequest><task>do it</task></ParentRequest>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "parent",
+                "thread-mw-2",
+                Payload::single("ParentRequest", "task", "do it"),
+            ))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let msgs = received.lock().await;
         assert_eq!(msgs.len(), 1, "parent should receive middleware-replaced response");
         assert!(msgs[0].contains("replaced"), "response should contain middleware replacement");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn middleware_pre_dispatch_transform() {
+        // Middleware transforms the payload before the handler sees it.
+        let received = Arc::new(Mutex::new(Vec::<String>::new()));
+        let received_clone = received.clone();
+
+        let sink = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let r = received_clone.clone();
+            Box::pin(async move {
+                r.lock().await.push(text_of(&p));
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("sink", "Greeting", sink, false, vec![], "Sink", None);
+        let threads = ThreadRegistry::new();
+
+        let mut pipeline = Pipeline::new(registry, threads);
+
+        // Middleware that marks the payload's text field
+        struct Quarantine;
+        #[async_trait]
+        impl Middleware for Quarantine {
+            async fn pre_dispatch(
+                &self,
+                _meta: &DispatchMeta,
+                payload: &ValidatedPayload,
+            ) -> Result<PreDispatchVerdict, PipelineError> {
+                let orig = payload.value.get("text").and_then(|v| v.as_text()).unwrap_or("");
+                let marked = PayloadValue::record([(
+                    "text",
+                    PayloadValue::text(format!("[quarantined] {orig}")),
+                )]);
+                Ok(PreDispatchVerdict::Transform(ValidatedPayload::new(
+                    payload.tag.clone(),
+                    marked,
+                )))
+            }
+        }
+        pipeline.add_middleware(Quarantine);
+        pipeline.run();
+
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "sink",
+                "thread-mw-transform",
+                Payload::single("Greeting", "text", "hello"),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let msgs = received.lock().await;
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].contains("[quarantined] hello"), "handler should see transformed payload, got: {}", msgs[0]);
 
         pipeline.shutdown().await;
     }
@@ -879,8 +1043,7 @@ mod tests {
         let sink = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
             let r = received_clone.clone();
             Box::pin(async move {
-                let text = String::from_utf8_lossy(&p.xml).to_string();
-                r.lock().await.push(text);
+                r.lock().await.push(text_of(&p));
                 Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
             })
         });
@@ -893,20 +1056,77 @@ mod tests {
         // No middleware added — empty vec
         pipeline.run();
 
-        let envelope = build_envelope(
-            "test-sender",
-            "sink",
-            "thread-mw-3",
-            b"<Greeting><text>works</text></Greeting>",
-        )
-        .unwrap();
-
-        pipeline.inject(envelope).await.unwrap();
+        pipeline
+            .inject(inbound(
+                "test-sender",
+                "sink",
+                "thread-mw-3",
+                Payload::single("Greeting", "text", "works"),
+            ))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let msgs = received.lock().await;
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("works"));
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn federation_egress_routes_remote_namespace() {
+        use crate::federation::{FederationEgress, Peer, PeerDirectory};
+        use crate::wire::Address;
+        use std::sync::Arc as StdArc;
+
+        // A local listener "bob" that must NOT receive a remote-addressed message.
+        let local_hits = Arc::new(Mutex::new(0u32));
+        let lh = local_hits.clone();
+        let bob = FnHandler(move |_p: ValidatedPayload, _ctx: HandlerContext| {
+            let lh = lh.clone();
+            Box::pin(async move {
+                *lh.lock().await += 1;
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+        let mut registry = ListenerRegistry::new();
+        registry.register("bob", "Greeting", bob, false, vec![], "local bob", None);
+        let threads = ThreadRegistry::new();
+        let mut pipeline = Pipeline::new(registry, threads);
+
+        // "ringhub" is a registered remote peer node.
+        let mut dir = PeerDirectory::new();
+        dir.register(Peer {
+            namespace: "ringhub".into(),
+            endpoint: "x".into(),
+            key: [0u8; 32],
+            inbound_provenance: Provenance::EMPTY,
+        });
+        let (fed_tx, mut fed_rx) = tokio::sync::mpsc::channel(8);
+        pipeline.with_federation(FederationEgress {
+            directory: StdArc::new(dir),
+            tx: fed_tx,
+        });
+        pipeline.run();
+
+        // Address to ringhub.bob → leading segment "ringhub" is remote → federation egress.
+        let env = Envelope {
+            meta: Meta {
+                from: "ext".into(),
+                to: Some(Address::parse("ringhub.bob").unwrap()),
+                thread: "t-fed".into(),
+                provenance: Provenance::EMPTY,
+            },
+            payload: Payload::single("Greeting", "text", "hi"),
+        };
+        pipeline.inject(encode_envelope(&env).unwrap()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The federation channel received it; local "bob" did not.
+        let got = fed_rx.recv().await.unwrap();
+        assert_eq!(got.meta.to.as_ref().unwrap().to_string(), "ringhub.bob");
+        assert_eq!(*local_hits.lock().await, 0);
 
         pipeline.shutdown().await;
     }

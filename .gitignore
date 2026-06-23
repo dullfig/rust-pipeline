@@ -1,1 +1,7 @@
 /target
+# Python (reference module in python/)
+__pycache__/
+*.pyc
+# Local tooling
+.claude/
+*.db

@@ -19,12 +19,13 @@
 //! This maps to what the Python version does: the XSD is generated
 //! from code, so we know the exact structure we expect.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use crate::error::{PipelineError, PipelineResult};
+use crate::wire::PayloadValue;
 
 /// Schema for a payload element.
 ///
@@ -159,6 +160,43 @@ pub fn validate_payload(payload_xml: &[u8], schema: &PayloadSchema) -> PipelineR
     Ok(())
 }
 
+/// Validate a typed [`PayloadValue`] against a schema.
+///
+/// This is the encapsulated counterpart to [`validate_payload`]: the pipeline validates
+/// the decoded value, never wire bytes. The payload `tag` selects the schema (so the
+/// "root tag" is implicit); a record's field names are the elements. Non-record values
+/// have no named fields, so a schema with required fields rejects them.
+pub fn validate_payload_value(value: &PayloadValue, schema: &PayloadSchema) -> PipelineResult<()> {
+    let present: HashSet<&str> = match value {
+        PayloadValue::Rec(fields) => fields.iter().map(|f| f.name.as_str()).collect(),
+        _ => HashSet::new(),
+    };
+
+    // Strict mode: reject unexpected fields.
+    if schema.strict {
+        for name in &present {
+            if !schema.fields.contains_key(*name) {
+                return Err(PipelineError::Validation(format!(
+                    "unexpected element <{name}> in <{}>",
+                    schema.root_tag
+                )));
+            }
+        }
+    }
+
+    // Required fields must be present.
+    for (field_name, field_schema) in &schema.fields {
+        if field_schema.required && !present.contains(field_name.as_str()) {
+            return Err(PipelineError::Validation(format!(
+                "missing required element <{field_name}> in <{}>",
+                schema.root_tag
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Build a permissive schema that accepts any payload with the given root tag.
 ///
 /// Used for handlers that don't declare a specific schema.
@@ -204,6 +242,17 @@ impl SchemaRegistry {
                 let schema = permissive_schema(tag);
                 validate_payload(payload_xml, &schema)
             }
+        }
+    }
+
+    /// Validate a typed [`PayloadValue`] against the schema registered for `tag`.
+    ///
+    /// This is the path the pipeline uses (it works with decoded values, not bytes).
+    /// Unknown tag ⇒ permissive (any record/value with that tag passes).
+    pub fn validate_value(&self, tag: &str, value: &PayloadValue) -> PipelineResult<()> {
+        match self.schemas.get(tag) {
+            Some(schema) => validate_payload_value(value, schema),
+            None => validate_payload_value(value, &permissive_schema(tag)),
         }
     }
 }

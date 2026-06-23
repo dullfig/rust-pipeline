@@ -11,9 +11,9 @@
 //! through the full validation gauntlet. The pipeline IS the trust boundary.
 //!
 //! ```text
-//! [Raw Bytes] → parse → validate(XSD) → route → enforce(peers) → dispatch(handler)
-//!      ↑                                                              |
-//!      └────── serialize to raw bytes (UNTRUSTED) ────────────────────┘
+//! [Raw Bytes] → decode → validate(schema) → route → enforce(peers) → dispatch(handler)
+//!      ↑                                                                  |
+//!      └────── encode to raw bytes (UNTRUSTED) ────────────────────────────┘
 //! ```
 //!
 //! # Quick Start
@@ -31,7 +31,7 @@
 //!     "Greeting",
 //!     FnHandler(|p: ValidatedPayload, _ctx: HandlerContext| {
 //!         Box::pin(async move {
-//!             Ok(HandlerResponse::Reply { payload_xml: p.xml })
+//!             Ok(HandlerResponse::Reply { payload: p.to_payload() })
 //!         })
 //!     }),
 //!     false,
@@ -44,31 +44,51 @@
 //! let mut pipeline = Pipeline::new(registry, threads);
 //! pipeline.run();
 //!
-//! // 3. Inject messages
-//! let envelope = build_envelope("sender", "echo", "thread-1", b"<Greeting><text>hi</text></Greeting>").unwrap();
-//! pipeline.inject(envelope).await.unwrap();
+//! // 3. Inject messages — handlers work with typed values, never bytes
+//! let envelope = Envelope {
+//!     meta: Meta {
+//!         from: "sender".into(),
+//!         to: Some("echo".into()),
+//!         thread: "thread-1".into(),
+//!         provenance: Provenance::EMPTY,
+//!     },
+//!     payload: Payload::single("Greeting", "text", "hi"),
+//! };
+//! pipeline.inject(encode_envelope(&envelope).unwrap()).await.unwrap();
 //!
 //! // 4. Shutdown when done
 //! pipeline.shutdown().await;
 //! # }
 //! ```
 
+pub mod codec;
 pub mod config;
 pub mod envelope;
+pub mod federation;
 pub mod error;
 pub mod handler;
 pub mod middleware;
 pub mod pipeline;
 pub mod registry;
 pub mod routing;
+pub mod switchboard;
 pub mod thread;
 pub mod validation;
+pub mod wire;
 
 /// Convenient re-exports for common usage.
 pub mod prelude {
+    pub use crate::codec::{decode_envelope, encode_envelope};
     pub use crate::config::{load_config, parse_config, ListenerConfig, PipelineConfig};
-    pub use crate::envelope::{build_envelope, parse_envelope, AgentId, Envelope, Meta, ThreadId};
+    pub use crate::envelope::{AgentId, ThreadId, ENVELOPE_NS};
     pub use crate::error::{PipelineError, PipelineResult};
+    pub use crate::federation::{
+        open, seal, AllowAll, Authorizer, FederationEgress, FederationError, FederationServer,
+        LocalDelivery, Peer, PeerDirectory, PeerKey, Transport,
+    };
+    pub use crate::wire::{
+        Address, Envelope, Field, Meta, Payload, PayloadValue, Provenance, Segment,
+    };
     pub use crate::handler::{
         FnHandler, Handler, HandlerContext, HandlerResponse, HandlerResult, ValidatedPayload,
     };
@@ -78,6 +98,7 @@ pub mod prelude {
     pub use crate::pipeline::Pipeline;
     pub use crate::registry::ListenerRegistry;
     pub use crate::routing::RoutingTable;
+    pub use crate::switchboard::{Materializer, Switchboard, SwitchboardError};
     pub use crate::thread::ThreadRegistry;
     pub use crate::validation::{
         FieldSchema, FieldType, PayloadSchema, SchemaRegistry,

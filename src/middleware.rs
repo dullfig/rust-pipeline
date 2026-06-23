@@ -41,6 +41,9 @@ pub struct DispatchMeta {
 pub enum PreDispatchVerdict {
     /// Allow dispatch to proceed to the next middleware / handler.
     Continue,
+    /// Replace the payload and continue dispatch with the new payload.
+    /// Use this to transform messages in-flight (e.g., quarantine tool output).
+    Transform(ValidatedPayload),
     /// Skip the handler entirely and return this response.
     ShortCircuit(HandlerResponse),
 }
@@ -88,6 +91,7 @@ pub trait Middleware: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{Payload, PayloadValue};
 
     /// No-op middleware: both hooks pass through.
     struct NoOp;
@@ -106,7 +110,7 @@ mod tests {
             _payload: &ValidatedPayload,
         ) -> Result<PreDispatchVerdict, PipelineError> {
             Ok(PreDispatchVerdict::ShortCircuit(HandlerResponse::Reply {
-                payload_xml: b"<Blocked/>".to_vec(),
+                payload: Payload::new("Blocked", PayloadValue::Nil),
             }))
         }
     }
@@ -121,10 +125,10 @@ mod tests {
     }
 
     fn test_payload() -> ValidatedPayload {
-        ValidatedPayload {
-            xml: b"<Greeting><text>hi</text></Greeting>".to_vec(),
-            tag: "Greeting".into(),
-        }
+        ValidatedPayload::new(
+            "Greeting",
+            PayloadValue::record([("text", PayloadValue::text("hi"))]),
+        )
     }
 
     #[tokio::test]
@@ -150,10 +154,43 @@ mod tests {
         let mw = AlwaysBlock;
         let result = mw.pre_dispatch(&test_meta(), &test_payload()).await.unwrap();
         match result {
-            PreDispatchVerdict::ShortCircuit(HandlerResponse::Reply { payload_xml }) => {
-                assert_eq!(payload_xml, b"<Blocked/>");
+            PreDispatchVerdict::ShortCircuit(HandlerResponse::Reply { payload }) => {
+                assert_eq!(payload.tag, "Blocked");
             }
             _ => panic!("expected ShortCircuit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transform_replaces_payload() {
+        struct Transformer;
+
+        #[async_trait]
+        impl Middleware for Transformer {
+            async fn pre_dispatch(
+                &self,
+                _meta: &DispatchMeta,
+                payload: &ValidatedPayload,
+            ) -> Result<PreDispatchVerdict, PipelineError> {
+                // Re-tag the payload, keeping its value.
+                Ok(PreDispatchVerdict::Transform(ValidatedPayload::new(
+                    "Wrapped",
+                    payload.value.clone(),
+                )))
+            }
+        }
+
+        let mw = Transformer;
+        let result = mw.pre_dispatch(&test_meta(), &test_payload()).await.unwrap();
+        match result {
+            PreDispatchVerdict::Transform(new_payload) => {
+                assert_eq!(new_payload.tag, "Wrapped");
+                assert_eq!(
+                    new_payload.value.get("text").and_then(|v| v.as_text()),
+                    Some("hi")
+                );
+            }
+            _ => panic!("expected Transform"),
         }
     }
 
@@ -170,7 +207,7 @@ mod tests {
                 _response: HandlerResponse,
             ) -> Result<PostDispatchVerdict, PipelineError> {
                 Ok(PostDispatchVerdict::Replace(HandlerResponse::Reply {
-                    payload_xml: b"<Replaced/>".to_vec(),
+                    payload: Payload::new("Replaced", PayloadValue::Nil),
                 }))
             }
         }
@@ -182,8 +219,8 @@ mod tests {
             .await
             .unwrap();
         match result {
-            PostDispatchVerdict::Replace(HandlerResponse::Reply { payload_xml }) => {
-                assert_eq!(payload_xml, b"<Replaced/>");
+            PostDispatchVerdict::Replace(HandlerResponse::Reply { payload }) => {
+                assert_eq!(payload.tag, "Replaced");
             }
             _ => panic!("expected Replace"),
         }
