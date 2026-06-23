@@ -11,10 +11,27 @@ update this module and re-run the tests.
 
 ## Install
 
+This is an **internal** AgentOS↔RingHub protocol — **don't publish it to public PyPI.**
+Pick one:
+
+**A. Install from the repo** (recommended — no publish, nothing public):
 ```
-pip install pynacl
+pip install "git+https://github.com/dullfig/rust-pipeline.git#subdirectory=python"
 ```
-Then vendor `rust_pipeline_federation.py` into RingHub (single file, no other deps).
+
+**B. Vendor the single file:**
+```
+pip install pynacl   # the only dependency
+# then copy python/rust_pipeline_federation.py into your project
+```
+
+**C. Build a wheel for a private index:**
+```
+cd python && python -m build      # → dist/*.whl, *.tar.gz; upload to your private index
+```
+
+Publishing to **public** PyPI would need a deliberate `twine upload` + a PyPI account, and
+is intentionally not wired up. (`pip install pynacl` is always required — it's the one dep.)
 
 ## Verify
 
