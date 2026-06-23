@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rust-pipeline-federation"
+version = "0.1.0"
+description = "Python reference implementation of the rust-pipeline federation wire protocol (AgentOS <-> peer nodes, e.g. RingHub)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "rust-pipeline" }]
+keywords = ["federation", "xchacha20poly1305", "agentos", "rust-pipeline"]
+dependencies = ["pynacl>=1.5"]
+
+[project.urls]
+Repository = "https://github.com/dullfig/rust-pipeline"
+
+# Single-module package; the dev/verification scripts (interop_test.py, selftest.py) are
+# intentionally NOT installed — they ship in the repo for CI, not in the wheel.
+[tool.setuptools]
+py-modules = ["rust_pipeline_federation"]
