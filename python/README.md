@@ -1,42 +1,38 @@
 # rust_pipeline_federation (Python)
 
-Python reference implementation of the **rust-pipeline federation wire protocol** — for
-RingHub (or any peer node) to exchange canonical envelopes with an AgentOS node over an
-encrypted, authenticated link.
+The Python **mirror** of rust-pipeline's federation wire protocol — the byte-compatible
+counterpart to `src/federation.rs` + `src/codec.rs`.
 
-It is **byte-for-byte interoperable** with `rust-pipeline/src/federation.rs` + `src/codec.rs`,
-verified by the cross-language tests below (seal in one language, open in the other, both
-directions). Keep the two in sync — if the Rust side changes the frame or envelope format,
-update this module and re-run the tests.
+> **INTERNAL.** This is a dependency of **`agentos-client`** (agentos-owned; it provides the
+> consumer-facing Bob-client API). It is **not for direct consumer use** — RingHub depends on
+> `agentos-client`, never on this module, and never vendors it. The protocol layer stays
+> protocol-only (no host helpers / config / client API here).
+> Boundary owned by the integration seam: `ringhub-integration/PYTHON_CLIENT_UNTANGLE.md`.
 
-## Install
+It is **byte-for-byte interoperable** with the Rust side, verified by the cross-language tests
+below (seal in one language, open in the other, both directions). That byte-compatibility is
+the contract — if the Rust side changes the frame or envelope format, update this module and
+re-run the tests.
 
-This is an **internal** AgentOS↔RingHub protocol — **don't publish it to public PyPI.**
-Pick one:
+## Install (for `agentos-client` only)
 
-**A. Install from the repo** (recommended — no publish, nothing public):
+`agentos-client` depends on this module; **consumers never install it directly.** RingHub
+depends on `agentos-client` and never references rust-pipeline — no import, no vendored copy,
+no `git+…rust-pipeline` reference (INV-1, INV-3, INV-4).
+
+For `agentos-client`'s build to pull this protocol mirror (agentos chooses the exact channel —
+a git ref, or a wheel on a private index):
 ```
 pip install "git+https://github.com/dullfig/rust-pipeline.git#subdirectory=python"
+# or build a wheel for a private index:  cd python && python -m build
 ```
 
-**B. Vendor the single file:**
-```
-pip install pynacl   # the only dependency
-# then copy python/rust_pipeline_federation.py into your project
-```
-
-**C. Build a wheel for a private index:**
-```
-cd python && python -m build      # → dist/*.whl, *.tar.gz; upload to your private index
-```
-
-Publishing to **public** PyPI would need a deliberate `twine upload` + a PyPI account, and
-is intentionally not wired up. (`pip install pynacl` is always required — it's the one dep.)
+**Don't publish to public PyPI** — it's internal. (`pynacl` is the one runtime dependency.)
 
 ## Verify
 
 - `python selftest.py` — **no Rust needed.** Python round-trip + opens a frozen *real*
-  Rust-sealed frame + wrong-key/tamper rejection. Run this in RingHub's CI.
+  Rust-sealed frame + wrong-key/tamper rejection. Run it in CI (rust-pipeline + agentos-client).
 - `python interop_test.py` — full cross-language check (builds the Rust `fed_interop`
   example via cargo; requires the rust-pipeline crate alongside). Seals in each language,
   opens in the other.
