@@ -1,11 +1,14 @@
 """
-rust_pipeline_federation — Python reference implementation of the rust-pipeline
-federation wire protocol, for RingHub (or any peer node) to exchange messages with an
-AgentOS node.
+rust_pipeline_federation — the Python mirror of rust-pipeline's federation wire protocol.
+
+INTERNAL — this is a dependency of `agentos-client` (which owns the consumer-facing
+Bob-client API). It is NOT for direct consumer use: RingHub depends on `agentos-client`,
+never on this module. Protocol layer only — no host helpers, config, or client API here.
+(Boundary owned by the integration seam: ringhub-integration/PYTHON_CLIENT_UNTANGLE.md.)
 
 Byte-for-byte interoperable with `rust-pipeline/src/federation.rs` + `src/codec.rs`
 (verified by `python/interop_test.py`, which seals on one side and opens on the other in
-both directions). Keep the two in sync.
+both directions). This byte-compatibility is the contract; keep the two in sync.
 
 Wire protocol
 -------------

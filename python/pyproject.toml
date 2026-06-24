@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rust-pipeline-federation"
 version = "0.1.0"
-description = "Python reference implementation of the rust-pipeline federation wire protocol (AgentOS <-> peer nodes, e.g. RingHub)."
+description = "Internal: Python mirror of rust-pipeline's federation wire protocol — a dependency of agentos-client, not for direct consumer use."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
