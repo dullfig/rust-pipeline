@@ -95,7 +95,7 @@ pub mod prelude {
     pub use crate::middleware::{
         DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict,
     };
-    pub use crate::pipeline::Pipeline;
+    pub use crate::pipeline::{Pipeline, SpawnObserver};
     pub use crate::registry::ListenerRegistry;
     pub use crate::routing::RoutingTable;
     pub use crate::switchboard::{Materializer, Switchboard, SwitchboardError};

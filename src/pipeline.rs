@@ -60,6 +60,9 @@ pub struct Pipeline {
 
     /// Optional federation egress — remote-node destinations escalate here.
     federation_egress: Option<FederationEgress>,
+
+    /// Optional observer for async-delegation obligations (host in-flight ledger hook).
+    spawn_observer: Option<Arc<dyn SpawnObserver>>,
 }
 
 // ── Internal stage message types ─────────────────────────────────────
@@ -82,6 +85,16 @@ struct RoutedMsg {
     target_name: AgentId,
 }
 
+/// Shared state every dispatch worker needs, bundled so it threads through the worker
+/// fan-out as a single cheaply-cloned handle instead of a long argument list.
+struct DispatchCtx {
+    registry: Arc<ListenerRegistry>,
+    threads: Arc<Mutex<ThreadRegistry>>,
+    reinject_tx: mpsc::Sender<Vec<u8>>,
+    middleware: Arc<Vec<Arc<dyn Middleware>>>,
+    spawn_observer: Option<Arc<dyn SpawnObserver>>,
+}
+
 /// Per-delivery-thread serial workers, keyed by thread id (= instance). The dispatch
 /// stage inserts a worker on first sight of a thread; the worker self-reaps after an idle
 /// period. All map mutation is done under the `Mutex`, which makes enqueue (dispatch) and
@@ -91,6 +104,25 @@ type WorkerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<RoutedMsg>>>>;
 
 /// How long a per-thread worker waits idle before reaping itself.
 const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Observes the async-delegation ("obligation") lifecycle so a host can maintain a durable
+/// **in-flight ledger**.
+///
+/// When a handler returns [`HandlerResponse::Spawn`], the pipeline opens an obligation:
+/// the caller will receive a result later, routed on `obligation_thread` (the detached
+/// chain). rust-pipeline owns *routing* that result home (via the thread chain); the host
+/// owns *durability, eviction-gating, and the watchdog*. In particular, a caller with an
+/// open obligation must not be garbage-collected (it may be tiered/evicted, but its state
+/// must remain restorable) until the obligation is discharged — by the result arriving, or
+/// by the host timing it out.
+///
+/// `on_spawn` is synchronous and must be cheap (it runs inline in dispatch); a host that
+/// needs async/durable bookkeeping should hand off to a channel or its journal.
+pub trait SpawnObserver: Send + Sync + 'static {
+    /// An async delegation was accepted: `caller` will later receive a result routed on
+    /// `obligation_thread`, produced by `callee`.
+    fn on_spawn(&self, caller: &str, callee: &str, obligation_thread: &str);
+}
 
 impl Pipeline {
     /// Create a new pipeline with the given registry and thread state.
@@ -108,6 +140,7 @@ impl Pipeline {
             shutdown_tx: None,
             handles: Vec::new(),
             federation_egress: None,
+            spawn_observer: None,
         }
     }
 
@@ -116,6 +149,12 @@ impl Pipeline {
     /// `run()`.
     pub fn with_federation(&mut self, egress: FederationEgress) {
         self.federation_egress = Some(egress);
+    }
+
+    /// Install a [`SpawnObserver`] so a host can ledger async-delegation obligations
+    /// (see [`HandlerResponse::Spawn`]). Call before `run()`.
+    pub fn with_spawn_observer(&mut self, observer: Arc<dyn SpawnObserver>) {
+        self.spawn_observer = Some(observer);
     }
 
     /// Add middleware to the dispatch chain.
@@ -175,13 +214,14 @@ impl Pipeline {
         // ── Stage 4: Dispatch + Reinject ─────────────────────────────
         // RoutedMsg → call handler → serialize response → reinject
         let middleware: Arc<Vec<Arc<dyn Middleware>>> = Arc::new(self.middleware.drain(..).collect());
-        let h4 = tokio::spawn(dispatch_stage(
-            routed_rx,
+        let dispatch_ctx = Arc::new(DispatchCtx {
+            registry: registry3,
+            threads: threads2,
             reinject_tx,
-            registry3,
-            threads2,
             middleware,
-        ));
+            spawn_observer: self.spawn_observer.clone(),
+        });
+        let h4 = tokio::spawn(dispatch_stage(routed_rx, dispatch_ctx));
 
         self.handles = vec![h1, h2, h3, h4];
 
@@ -392,13 +432,7 @@ async fn route_stage(
 /// Enqueue below and reap in [`serial_worker`] both mutate the map only while holding its
 /// `Mutex`, and the per-worker send is synchronous (unbounded) — so they are mutually
 /// exclusive. That is what guarantees exactly one live worker per key and no lost message.
-async fn dispatch_stage(
-    mut rx: mpsc::Receiver<RoutedMsg>,
-    reinject_tx: mpsc::Sender<Vec<u8>>,
-    registry: Arc<ListenerRegistry>,
-    threads: Arc<Mutex<ThreadRegistry>>,
-    middleware: Arc<Vec<Arc<dyn Middleware>>>,
-) {
+async fn dispatch_stage(mut rx: mpsc::Receiver<RoutedMsg>, ctx: Arc<DispatchCtx>) {
     let workers: WorkerMap = Arc::new(Mutex::new(HashMap::new()));
 
     while let Some(msg) = rx.recv().await {
@@ -413,15 +447,7 @@ async fn dispatch_stage(
                 Some(tx) => tx.clone(),
                 None => {
                     let (wtx, wrx) = mpsc::unbounded_channel();
-                    tokio::spawn(serial_worker(
-                        key.clone(),
-                        wrx,
-                        workers.clone(),
-                        registry.clone(),
-                        threads.clone(),
-                        reinject_tx.clone(),
-                        middleware.clone(),
-                    ));
+                    tokio::spawn(serial_worker(key.clone(), wrx, workers.clone(), ctx.clone()));
                     map.insert(key.clone(), wtx.clone());
                     wtx
                 }
@@ -448,15 +474,12 @@ async fn serial_worker(
     key: String,
     mut wrx: mpsc::UnboundedReceiver<RoutedMsg>,
     workers: WorkerMap,
-    registry: Arc<ListenerRegistry>,
-    threads: Arc<Mutex<ThreadRegistry>>,
-    reinject_tx: mpsc::Sender<Vec<u8>>,
-    middleware: Arc<Vec<Arc<dyn Middleware>>>,
+    ctx: Arc<DispatchCtx>,
 ) {
     loop {
         match tokio::time::timeout(WORKER_IDLE_TIMEOUT, wrx.recv()).await {
             Ok(Some(msg)) => {
-                process_message(msg, &registry, &threads, &reinject_tx, &middleware).await;
+                process_message(msg, &ctx).await;
             }
             Ok(None) => break, // all senders dropped — pipeline shutdown
             Err(_) => {
@@ -472,7 +495,7 @@ async fn serial_worker(
                     }
                     Ok(msg) => {
                         drop(map);
-                        process_message(msg, &registry, &threads, &reinject_tx, &middleware).await;
+                        process_message(msg, &ctx).await;
                     }
                 }
             }
@@ -487,13 +510,15 @@ async fn serial_worker(
 /// Thread-registry mutations take the lock only for the mutation itself; the guard is
 /// dropped **before** the `reinject_tx.send().await` so a slow/full reinject channel can't
 /// serialize concurrent workers on the thread lock.
-async fn process_message(
-    msg: RoutedMsg,
-    registry: &Arc<ListenerRegistry>,
-    threads: &Arc<Mutex<ThreadRegistry>>,
-    reinject_tx: &mpsc::Sender<Vec<u8>>,
-    middleware: &Arc<Vec<Arc<dyn Middleware>>>,
-) {
+async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
+    let DispatchCtx {
+        registry,
+        threads,
+        reinject_tx,
+        middleware,
+        spawn_observer,
+    } = ctx;
+
     let handler = match registry.get_handler(&msg.target_name) {
         Some(h) => h,
         None => {
@@ -643,6 +668,74 @@ async fn process_message(
                     }
                 }
                 None => debug!(handler = %msg.target_name, "chain exhausted — reply dropped"),
+            }
+        }
+        Ok(HandlerResponse::Spawn { to, payload }) => {
+            // Async delegation. Two things happen, in this order:
+            //   1. Hand the work to the callee on a DETACHED chain that records THIS handler
+            //      as the return target — so the callee's eventual Reply prunes back here
+            //      through the ordinary reply path (the callee never learns who called it).
+            //   2. Immediately ack THIS handler on its own thread, so it resumes and can
+            //      respond to its own caller ("received ≠ done").
+            // The ack is sent only AFTER a successful, peer-checked handoff, so an
+            // unroutable spawn acks `accepted: false` rather than a false "working on it".
+            let to_name = to.organism().unwrap_or_default().to_string();
+            let accepted = match registry.routing.enforce_peers(&msg.target_name, &to_name) {
+                Ok(()) => {
+                    let obligation_thread = {
+                        let mut threads = threads.lock().await;
+                        threads.extend_chain(&msg.envelope.meta.thread, &to_name)
+                    };
+                    let work = Envelope {
+                        meta: Meta {
+                            from: Address::flat(&msg.target_name),
+                            to: Some(to),
+                            thread: obligation_thread.clone(),
+                            provenance: inbound_prov,
+                        },
+                        payload,
+                    };
+                    match encode_envelope(&work) {
+                        Ok(raw) => {
+                            let _ = reinject_tx.send(raw).await;
+                            debug!(handler = %msg.target_name, to = %to_name, thread = %obligation_thread, "spawn → detached delegation");
+                            // Obligation opened — surface it for the host's in-flight ledger.
+                            if let Some(obs) = spawn_observer {
+                                obs.on_spawn(&msg.target_name, &to_name, &obligation_thread);
+                            }
+                            true
+                        }
+                        Err(e) => {
+                            error!("failed to build spawn envelope: {e}");
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("spawn rejected (peer): {e}");
+                    false
+                }
+            };
+
+            // Ack the caller on its own thread so it can proceed regardless of outcome.
+            let ack = Payload::new(
+                "SpawnAck",
+                PayloadValue::record([("accepted", PayloadValue::Boolean(accepted))]),
+            );
+            let ack_env = Envelope {
+                meta: Meta {
+                    from: Address::flat(&to_name),
+                    to: Some(Address::flat(&msg.target_name)),
+                    thread: msg.envelope.meta.thread.clone(),
+                    provenance: inbound_prov,
+                },
+                payload: ack,
+            };
+            match encode_envelope(&ack_env) {
+                Ok(raw) => {
+                    let _ = reinject_tx.send(raw).await;
+                }
+                Err(e) => error!("failed to build spawn-ack envelope: {e}"),
             }
         }
         Ok(HandlerResponse::Send { to, payload }) => {
@@ -1253,6 +1346,127 @@ mod tests {
             vec!["first".to_string(), "second".to_string()],
             "same-thread messages must run in arrival order"
         );
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_async_delegation_ack_then_callback() {
+        // The full async-delegation loop:
+        //   user → bob "book flight"
+        //   bob SPAWNS travelagent (async), gets an immediate ack, tells user "I'll let you know"
+        //   travelagent works (slowly), replies with the ticket — routed back to bob
+        //   bob tells user the result
+        // Proves: the caller isn't blocked, the callee is oblivious to who called it (the
+        // pipeline routes the result home via the chain), and the obligation is observed.
+        use std::sync::Mutex as StdMutex;
+
+        // Observer records opened obligations for the host ledger.
+        #[derive(Default)]
+        struct Recorder {
+            spawns: StdMutex<Vec<(String, String, String)>>,
+        }
+        impl SpawnObserver for Recorder {
+            fn on_spawn(&self, caller: &str, callee: &str, obligation_thread: &str) {
+                self.spawns.lock().unwrap().push((
+                    caller.to_string(),
+                    callee.to_string(),
+                    obligation_thread.to_string(),
+                ));
+            }
+        }
+
+        // "user" records what Bob sends back to it.
+        let user_msgs = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let um = user_msgs.clone();
+        let user = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let um = um.clone();
+            Box::pin(async move {
+                um.lock().unwrap().push(text_of(&p));
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        // "bob" — the outer skin. Book → spawn; ack → interim status; result → final answer.
+        let bob = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                let r = match p.tag.as_str() {
+                    "BookFlight" => HandlerResponse::Spawn {
+                        to: "travelagent".into(),
+                        payload: Payload::single("FindFlight", "route", "SFO-JFK"),
+                    },
+                    "SpawnAck" => HandlerResponse::Reply {
+                        payload: Payload::single(
+                            "Status",
+                            "text",
+                            "I contacted the travel agent, I'll let you know",
+                        ),
+                    },
+                    "ToolResponse" => {
+                        let ticket = p
+                            .value
+                            .get("result")
+                            .and_then(|v| v.as_text())
+                            .unwrap_or("")
+                            .to_string();
+                        HandlerResponse::Reply {
+                            payload: Payload::single("Status", "text", format!("found it: {ticket}")),
+                        }
+                    }
+                    _ => HandlerResponse::None,
+                };
+                Ok(r) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        // "travelagent" — does slow work, replies. Oblivious to who spawned it.
+        let travelagent = FnHandler(move |_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                Ok(HandlerResponse::Reply {
+                    payload: Payload::new(
+                        "ToolResponse",
+                        PayloadValue::record([
+                            ("success", PayloadValue::Boolean(true)),
+                            ("result", PayloadValue::text("ticket ABC123")),
+                        ]),
+                    ),
+                }) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        // bob is an agent allowed to message travelagent and reply to user.
+        let bob_peers = vec!["travelagent".to_string(), "user".to_string()];
+        registry.register("bob", "BookFlight", bob, true, bob_peers.clone(), "Bob", None);
+        registry.routing.register("bob", "SpawnAck", true, bob_peers.clone(), "Bob");
+        registry.routing.register("bob", "ToolResponse", true, bob_peers, "Bob");
+        registry.register("travelagent", "FindFlight", travelagent, false, vec![], "TravelAgent", None);
+        registry.register("user", "Status", user, false, vec![], "User", None);
+
+        let observer = Arc::new(Recorder::default());
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.with_spawn_observer(observer.clone());
+        pipeline.run();
+
+        pipeline
+            .inject(inbound("user", "bob", "T0", Payload::single("BookFlight", "route", "SFO-JFK")))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // User got the interim status first, then the eventual result — in order.
+        let msgs = user_msgs.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 2, "user should receive interim status then result, got {msgs:?}");
+        assert!(msgs[0].contains("I'll let you know"), "first should be the ack status: {}", msgs[0]);
+        assert!(msgs[1].contains("ticket ABC123"), "second should be the result: {}", msgs[1]);
+
+        // Exactly one obligation opened: bob → travelagent.
+        let spawns = observer.spawns.lock().unwrap().clone();
+        assert_eq!(spawns.len(), 1, "one obligation should have opened");
+        assert_eq!(spawns[0].0, "bob");
+        assert_eq!(spawns[0].1, "travelagent");
 
         pipeline.shutdown().await;
     }
