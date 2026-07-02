@@ -61,8 +61,8 @@ pub struct Pipeline {
     /// Optional federation egress — remote-node destinations escalate here.
     federation_egress: Option<FederationEgress>,
 
-    /// Optional observer for async-delegation obligations (host in-flight ledger hook).
-    spawn_observer: Option<Arc<dyn SpawnObserver>>,
+    /// Optional observer for in-flight call edges (host supervision / ledger hook).
+    dispatch_observer: Option<Arc<dyn DispatchObserver>>,
 }
 
 // ── Internal stage message types ─────────────────────────────────────
@@ -92,7 +92,7 @@ struct DispatchCtx {
     threads: Arc<Mutex<ThreadRegistry>>,
     reinject_tx: mpsc::Sender<Vec<u8>>,
     middleware: Arc<Vec<Arc<dyn Middleware>>>,
-    spawn_observer: Option<Arc<dyn SpawnObserver>>,
+    dispatch_observer: Option<Arc<dyn DispatchObserver>>,
 }
 
 /// Per-delivery-thread serial workers, keyed by thread id (= instance). The dispatch
@@ -105,23 +105,43 @@ type WorkerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<RoutedMsg>>>>;
 /// How long a per-thread worker waits idle before reaping itself.
 const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Observes the async-delegation ("obligation") lifecycle so a host can maintain a durable
-/// **in-flight ledger**.
+/// Whether an in-flight call edge is a synchronous sub-call or an async delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    /// A [`HandlerResponse::Send`] sub-call: the caller is **suspended** on the chain until
+    /// the callee replies.
+    Sync,
+    /// A [`HandlerResponse::Spawn`] delegation: the caller was **acked and continues**; the
+    /// result returns later.
+    Async,
+}
+
+/// Observes the in-flight **call-edge** lifecycle so a host can supervise sub-calls.
 ///
-/// When a handler returns [`HandlerResponse::Spawn`], the pipeline opens an obligation:
-/// the caller will receive a result later, routed on `obligation_thread` (the detached
-/// chain). rust-pipeline owns *routing* that result home (via the thread chain); the host
-/// owns *durability, eviction-gating, and the watchdog*. In particular, a caller with an
-/// open obligation must not be garbage-collected (it may be tiered/evicted, but its state
-/// must remain restorable) until the obligation is discharged — by the result arriving, or
-/// by the host timing it out.
+/// The pipeline is the only layer that sees a handler open a call edge (`Send`/`Spawn`
+/// extends the chain) and later see it close (the callee's response prunes back), so it
+/// emits those events; the **host decides what to do with them** — apply deadlines/timeouts
+/// (reliability is host policy above the wire) and, for async edges, maintain the durable
+/// in-flight ledger that gates eviction (a caller with an open async edge may be
+/// tiered/evicted but must remain restorable — not garbage-collected — until it closes).
 ///
-/// `on_spawn` is synchronous and must be cheap (it runs inline in dispatch); a host that
-/// needs async/durable bookkeeping should hand off to a channel or its journal.
-pub trait SpawnObserver: Send + Sync + 'static {
-    /// An async delegation was accepted: `caller` will later receive a result routed on
-    /// `obligation_thread`, produced by `callee`.
-    fn on_spawn(&self, caller: &str, callee: &str, obligation_thread: &str);
+/// This is what lets the host time out **both** a hung synchronous `Send` (the caller is
+/// suspended, waiting for a reply that never comes) and a hung async `Spawn` — the pipeline
+/// informs the host that a sub-call is running; the host sets the deadline and, on expiry,
+/// recovers (e.g. injects a failure back to the caller).
+///
+/// `on_open`/`on_close` are synchronous and must be cheap (they run inline in dispatch); a
+/// host needing async/durable bookkeeping should hand off to a channel or its journal.
+pub trait DispatchObserver: Send + Sync + 'static {
+    /// A call edge opened: `caller` dispatched to `callee`, and a response is expected on
+    /// `thread`. For [`CallKind::Async`] this is an obligation (don't GC the caller until it
+    /// closes); for [`CallKind::Sync`] the caller is suspended awaiting it.
+    fn on_open(&self, caller: &str, callee: &str, thread: &str, kind: CallKind);
+
+    /// The call edge identified by `thread` closed — the callee produced its response and
+    /// the chain pruned back. Threads that were never opened (e.g. external ingress) should
+    /// be ignored.
+    fn on_close(&self, thread: &str);
 }
 
 impl Pipeline {
@@ -140,7 +160,7 @@ impl Pipeline {
             shutdown_tx: None,
             handles: Vec::new(),
             federation_egress: None,
-            spawn_observer: None,
+            dispatch_observer: None,
         }
     }
 
@@ -151,10 +171,11 @@ impl Pipeline {
         self.federation_egress = Some(egress);
     }
 
-    /// Install a [`SpawnObserver`] so a host can ledger async-delegation obligations
-    /// (see [`HandlerResponse::Spawn`]). Call before `run()`.
-    pub fn with_spawn_observer(&mut self, observer: Arc<dyn SpawnObserver>) {
-        self.spawn_observer = Some(observer);
+    /// Install a [`DispatchObserver`] so a host can supervise in-flight call edges —
+    /// deadlines/timeouts for `Send` and `Spawn`, and the async in-flight ledger. Call
+    /// before `run()`.
+    pub fn with_dispatch_observer(&mut self, observer: Arc<dyn DispatchObserver>) {
+        self.dispatch_observer = Some(observer);
     }
 
     /// Add middleware to the dispatch chain.
@@ -219,7 +240,7 @@ impl Pipeline {
             threads: threads2,
             reinject_tx,
             middleware,
-            spawn_observer: self.spawn_observer.clone(),
+            dispatch_observer: self.dispatch_observer.clone(),
         });
         let h4 = tokio::spawn(dispatch_stage(routed_rx, dispatch_ctx));
 
@@ -516,7 +537,7 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
         threads,
         reinject_tx,
         middleware,
-        spawn_observer,
+        dispatch_observer,
     } = ctx;
 
     let handler = match registry.get_handler(&msg.target_name) {
@@ -607,6 +628,10 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
 
     match result {
         Ok(HandlerResponse::None) => {
+            // The callee finished with nothing to say — its call edge (if any) closes.
+            if let Some(obs) = dispatch_observer {
+                obs.on_close(&msg.envelope.meta.thread);
+            }
             // Synthesize ACK if a parent exists in the thread chain. Take the lock only to
             // prune, then release it before building/reinjecting.
             let prune = {
@@ -643,6 +668,11 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
             }
         }
         Ok(HandlerResponse::Reply { payload }) => {
+            // The callee on this thread produced its response — any call edge awaiting on
+            // this thread is now closed (the host clears its deadline / discharges it).
+            if let Some(obs) = dispatch_observer {
+                obs.on_close(&msg.envelope.meta.thread);
+            }
             let prune = {
                 let mut threads = threads.lock().await;
                 threads.prune_for_response(&msg.envelope.meta.thread)
@@ -699,9 +729,10 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
                         Ok(raw) => {
                             let _ = reinject_tx.send(raw).await;
                             debug!(handler = %msg.target_name, to = %to_name, thread = %obligation_thread, "spawn → detached delegation");
-                            // Obligation opened — surface it for the host's in-flight ledger.
-                            if let Some(obs) = spawn_observer {
-                                obs.on_spawn(&msg.target_name, &to_name, &obligation_thread);
+                            // Async call edge opened — surface it for the host's in-flight
+                            // ledger + deadline.
+                            if let Some(obs) = dispatch_observer {
+                                obs.on_open(&msg.target_name, &to_name, &obligation_thread, CallKind::Async);
                             }
                             true
                         }
@@ -750,13 +781,13 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
                 let mut threads = threads.lock().await;
                 threads.extend_chain(&msg.envelope.meta.thread, &to_name)
             };
-            debug!(handler = %msg.target_name, to = %to, "send → extended chain");
+            debug!(handler = %msg.target_name, to = %to, "send → extended chain (sync sub-call)");
             // Build envelope and serialize to raw bytes (UNTRUSTED)
             let env = Envelope {
                 meta: Meta {
                     from: Address::flat(&msg.target_name),
                     to: Some(to),
-                    thread: new_thread,
+                    thread: new_thread.clone(),
                     provenance: inbound_prov,
                 },
                 payload,
@@ -764,6 +795,12 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
             match encode_envelope(&env) {
                 Ok(raw) => {
                     let _ = reinject_tx.send(raw).await;
+                    // A synchronous call edge opened: the caller is now suspended awaiting
+                    // the reply on `new_thread`. Surface it so the host can apply a deadline
+                    // (and time out a hung sub-call).
+                    if let Some(obs) = dispatch_observer {
+                        obs.on_open(&msg.target_name, &to_name, &new_thread, CallKind::Sync);
+                    }
                 }
                 Err(e) => error!("failed to build send envelope: {e}"),
             }
@@ -1361,18 +1398,23 @@ mod tests {
         // pipeline routes the result home via the chain), and the obligation is observed.
         use std::sync::Mutex as StdMutex;
 
-        // Observer records opened obligations for the host ledger.
+        // Observer records opened/closed call edges for the host ledger.
         #[derive(Default)]
         struct Recorder {
-            spawns: StdMutex<Vec<(String, String, String)>>,
+            opens: StdMutex<Vec<(String, String, String, CallKind)>>,
+            closes: StdMutex<Vec<String>>,
         }
-        impl SpawnObserver for Recorder {
-            fn on_spawn(&self, caller: &str, callee: &str, obligation_thread: &str) {
-                self.spawns.lock().unwrap().push((
+        impl DispatchObserver for Recorder {
+            fn on_open(&self, caller: &str, callee: &str, thread: &str, kind: CallKind) {
+                self.opens.lock().unwrap().push((
                     caller.to_string(),
                     callee.to_string(),
-                    obligation_thread.to_string(),
+                    thread.to_string(),
+                    kind,
                 ));
+            }
+            fn on_close(&self, thread: &str) {
+                self.closes.lock().unwrap().push(thread.to_string());
             }
         }
 
@@ -1446,7 +1488,7 @@ mod tests {
 
         let observer = Arc::new(Recorder::default());
         let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
-        pipeline.with_spawn_observer(observer.clone());
+        pipeline.with_dispatch_observer(observer.clone());
         pipeline.run();
 
         pipeline
@@ -1462,11 +1504,76 @@ mod tests {
         assert!(msgs[0].contains("I'll let you know"), "first should be the ack status: {}", msgs[0]);
         assert!(msgs[1].contains("ticket ABC123"), "second should be the result: {}", msgs[1]);
 
-        // Exactly one obligation opened: bob → travelagent.
-        let spawns = observer.spawns.lock().unwrap().clone();
-        assert_eq!(spawns.len(), 1, "one obligation should have opened");
-        assert_eq!(spawns[0].0, "bob");
-        assert_eq!(spawns[0].1, "travelagent");
+        // Exactly one ASYNC edge opened (bob → travelagent), and it later closed.
+        let opens = observer.opens.lock().unwrap().clone();
+        assert_eq!(opens.len(), 1, "one async edge should have opened");
+        assert_eq!((opens[0].0.as_str(), opens[0].1.as_str(), opens[0].3), ("bob", "travelagent", CallKind::Async));
+        let closes = observer.closes.lock().unwrap().clone();
+        assert!(closes.contains(&opens[0].2), "the async edge should have closed when travelagent replied");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_emits_sync_open_and_close() {
+        // A synchronous Send opens a Sync call edge (the caller is now suspended) and closes
+        // it when the callee replies — the visibility the host needs to time out a hung
+        // sub-call ("the handler informs the host that a tool is running").
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            opens: StdMutex<Vec<(String, String, String, CallKind)>>,
+            closes: StdMutex<Vec<String>>,
+        }
+        impl DispatchObserver for Recorder {
+            fn on_open(&self, caller: &str, callee: &str, thread: &str, kind: CallKind) {
+                self.opens.lock().unwrap().push((caller.into(), callee.into(), thread.into(), kind));
+            }
+            fn on_close(&self, thread: &str) {
+                self.closes.lock().unwrap().push(thread.into());
+            }
+        }
+
+        // parent: first call (Req) → Send to child; later (child's reply) → None.
+        let parent = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                let r = if p.tag == "Req" {
+                    HandlerResponse::Send { to: "child".into(), payload: Payload::single("ChildReq", "x", "go") }
+                } else {
+                    HandlerResponse::None
+                };
+                Ok(r) as Result<HandlerResponse, PipelineError>
+            })
+        });
+        let child = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                Ok(HandlerResponse::Reply { payload: Payload::single("ChildResp", "x", "done") })
+                    as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("parent", "Req", parent, false, vec![], "Parent", None);
+        registry.routing.register("parent", "ChildResp", false, vec![], "Parent");
+        registry.register("child", "ChildReq", child, false, vec![], "Child", None);
+
+        let observer = Arc::new(Recorder::default());
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.with_dispatch_observer(observer.clone());
+        pipeline.run();
+
+        pipeline
+            .inject(inbound("sender", "parent", "T0", Payload::single("Req", "x", "start")))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let opens = observer.opens.lock().unwrap().clone();
+        assert_eq!(opens.len(), 1, "a Send should open exactly one edge, got {opens:?}");
+        assert_eq!((opens[0].0.as_str(), opens[0].1.as_str(), opens[0].3), ("parent", "child", CallKind::Sync));
+        let closes = observer.closes.lock().unwrap().clone();
+        assert!(closes.contains(&opens[0].2), "the sync edge should close when child replies");
 
         pipeline.shutdown().await;
     }
