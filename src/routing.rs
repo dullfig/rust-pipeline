@@ -106,11 +106,15 @@ impl RoutingTable {
             None => return Ok(()), // unknown sender (e.g., "system") → always allowed
         };
 
-        // Non-agents have no peer restrictions
-        if !sender.is_agent || sender.peers.is_empty() {
+        // Non-agents (system, tools) have no peer restrictions.
+        if !sender.is_agent {
             return Ok(());
         }
 
+        // An agent's `peers` is its allowlist. EMPTY = deny all — set membership
+        // against {} is false, so an agent that declares no peers reaches no one.
+        // (This is fail-CLOSED: empty is NOT "unrestricted". Reply-to-caller and
+        // the LLM path are ungated, so a no-tools agent still converses.)
         if sender.peers.contains(to_agent) {
             Ok(())
         } else {
@@ -197,6 +201,18 @@ mod tests {
     fn non_agent_no_restrictions() {
         let table = sample_table();
         // shouter is not an agent → can message anyone
+        table.enforce_peers("shouter", "greeter").unwrap();
+    }
+
+    #[test]
+    fn empty_peers_agent_denies_all() {
+        // An AGENT that declares no peers reaches NO ONE (fail-closed): membership
+        // against {} is false. Empty is deny-all, not "unrestricted".
+        let mut table = sample_table();
+        table.register("locked", "LockedTask", true, vec![], "agent with no peers");
+        let err = table.enforce_peers("locked", "shouter").unwrap_err();
+        assert!(matches!(err, PipelineError::PeerViolation { .. }));
+        // A NON-agent with empty peers stays unrestricted (system/tools bypass).
         table.enforce_peers("shouter", "greeter").unwrap();
     }
 
