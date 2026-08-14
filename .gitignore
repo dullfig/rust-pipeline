@@ -2,6 +2,8 @@
 # Python (reference module in python/)
 __pycache__/
 *.pyc
+python/build/
+python/*.egg-info/
 # Local tooling
 .claude/
 *.db
