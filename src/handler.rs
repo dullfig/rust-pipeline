@@ -72,9 +72,26 @@ pub struct HandlerContext {
 /// pipeline serializes them — handlers never produce bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandlerResponse {
-    /// Send a new message to a target address (forward).
-    /// Pipeline enforces peer constraints and extends the thread chain.
+    /// Send a new message to a target address and **wait** for its reply (a synchronous
+    /// sub-call). The pipeline enforces peer constraints, extends the thread chain, and
+    /// suspends this conversation until the callee replies back up the chain.
     Send { to: Address, payload: Payload },
+
+    /// **Asynchronously** delegate to a target and continue immediately — the async dual of
+    /// [`Send`](HandlerResponse::Send).
+    ///
+    /// The pipeline hands the work to `to` on a detached branch whose chain records *this*
+    /// handler as the return target, then synthesizes an immediate acknowledgement (a
+    /// `SpawnAck` payload) back to this handler so it can proceed — e.g. tell its own caller
+    /// "working on it" — without blocking on the result. The eventual result routes back
+    /// through the ordinary reply path, so **the callee never learns who spawned it**;
+    /// return routing is the pipeline's bookkeeping (the thread chain), not the callee's
+    /// concern.
+    ///
+    /// This is "received ≠ done": the ack means *accepted for processing*, and the pipeline
+    /// only acks once the handoff is routable (peer-checked) — a spawn that can't be
+    /// delivered acks with `accepted: false` rather than a false "working on it".
+    Spawn { to: Address, payload: Payload },
 
     /// Respond back to the caller (prune the thread chain).
     Reply { payload: Payload },
@@ -95,6 +112,14 @@ impl HandlerResponse {
     /// Convenience: send a payload to a target.
     pub fn send(to: impl Into<Address>, payload: Payload) -> HandlerResponse {
         HandlerResponse::Send {
+            to: to.into(),
+            payload,
+        }
+    }
+
+    /// Convenience: asynchronously delegate a payload to a target.
+    pub fn spawn(to: impl Into<Address>, payload: Payload) -> HandlerResponse {
+        HandlerResponse::Spawn {
             to: to.into(),
             payload,
         }
