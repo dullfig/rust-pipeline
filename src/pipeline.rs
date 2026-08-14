@@ -14,7 +14,9 @@
 //! at the ingress — losing all trust, going through the full validation
 //! gauntlet again. The pipeline IS the trust boundary.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -79,6 +81,16 @@ struct RoutedMsg {
     payload: ValidatedPayload,
     target_name: AgentId,
 }
+
+/// Per-delivery-thread serial workers, keyed by thread id (= instance). The dispatch
+/// stage inserts a worker on first sight of a thread; the worker self-reaps after an idle
+/// period. All map mutation is done under the `Mutex`, which makes enqueue (dispatch) and
+/// reap (worker) mutually exclusive — the invariant that keeps exactly one worker alive
+/// per key and loses no message.
+type WorkerMap = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<RoutedMsg>>>>;
+
+/// How long a per-thread worker waits idle before reaping itself.
+const WORKER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Pipeline {
     /// Create a new pipeline with the given registry and thread state.
@@ -364,7 +376,22 @@ async fn route_stage(
     }
 }
 
-/// Stage 4: Dispatch to handler and reinject response.
+/// Stage 4: Dispatch — fan out to per-thread serial workers.
+///
+/// The dispatcher itself does no handler work; it routes each [`RoutedMsg`] to the worker
+/// for its delivery thread (spawning one on first sight), so that:
+///
+/// - **serial per thread (= per instance):** messages sharing a thread id go to the same
+///   worker's ordered queue and run one-at-a-time, in arrival order. This is the
+///   `bob[alice]` invariant — a handler is never called concurrently for the same
+///   instance, so its `&self` / checkpoint state is safe.
+/// - **concurrent across threads (= across users):** different thread ids have independent
+///   workers, so `bob[alice]` and `bob[carol]` run in parallel; a slow handler no longer
+///   head-of-line-blocks the whole pipeline.
+///
+/// Enqueue below and reap in [`serial_worker`] both mutate the map only while holding its
+/// `Mutex`, and the per-worker send is synchronous (unbounded) — so they are mutually
+/// exclusive. That is what guarantees exactly one live worker per key and no lost message.
 async fn dispatch_stage(
     mut rx: mpsc::Receiver<RoutedMsg>,
     reinject_tx: mpsc::Sender<Vec<u8>>,
@@ -372,231 +399,283 @@ async fn dispatch_stage(
     threads: Arc<Mutex<ThreadRegistry>>,
     middleware: Arc<Vec<Arc<dyn Middleware>>>,
 ) {
+    let workers: WorkerMap = Arc::new(Mutex::new(HashMap::new()));
+
     while let Some(msg) = rx.recv().await {
-        let handler = match registry.get_handler(&msg.target_name) {
-            Some(h) => h,
-            None => {
-                error!(target = %msg.target_name, "handler not found (registry inconsistency)");
-                continue;
-            }
-        };
+        let key = msg.envelope.meta.thread.clone();
+        let mut pending = Some(msg);
 
-        let ctx = HandlerContext {
-            thread_id: msg.envelope.meta.thread.clone(),
-            from: msg.envelope.meta.from.clone(),
-            own_name: Address::flat(&msg.target_name),
-            provenance: msg.envelope.meta.provenance,
-        };
-
-        // Build dispatch metadata for middleware (name-keyed)
-        let meta = DispatchMeta {
-            from: msg.envelope.meta.from.organism().unwrap_or_default().to_string(),
-            to: msg.target_name.clone(),
-            thread_id: msg.envelope.meta.thread.clone(),
-            payload_tag: msg.payload.tag.clone(),
-        };
-
-        // Pre-dispatch middleware chain (in registration order)
-        // Payload may be transformed in-flight by middleware.
-        let mut payload = msg.payload.clone();
-        let mut short_circuited = None;
-        for mw in middleware.iter() {
-            match mw.pre_dispatch(&meta, &payload).await {
-                Ok(PreDispatchVerdict::Continue) => {}
-                Ok(PreDispatchVerdict::Transform(new_payload)) => {
-                    debug!(
-                        handler = %msg.target_name,
-                        "middleware transformed payload"
-                    );
-                    payload = new_payload;
+        // Hand off to the thread's worker. The retry loop only re-runs in the (normally
+        // unreachable) case that a worker's channel was found closed under the lock.
+        while let Some(m) = pending.take() {
+            let mut map = workers.lock().await;
+            let tx = match map.get(&key) {
+                Some(tx) => tx.clone(),
+                None => {
+                    let (wtx, wrx) = mpsc::unbounded_channel();
+                    tokio::spawn(serial_worker(
+                        key.clone(),
+                        wrx,
+                        workers.clone(),
+                        registry.clone(),
+                        threads.clone(),
+                        reinject_tx.clone(),
+                        middleware.clone(),
+                    ));
+                    map.insert(key.clone(), wtx.clone());
+                    wtx
                 }
-                Ok(PreDispatchVerdict::ShortCircuit(response)) => {
-                    debug!(
-                        handler = %msg.target_name,
-                        "middleware short-circuited dispatch"
-                    );
-                    short_circuited = Some(Ok(response));
-                    break;
-                }
-                Err(e) => {
-                    short_circuited = Some(Err(e));
-                    break;
+            };
+            // Synchronous unbounded send while still holding the map lock, so this can't
+            // interleave with a worker reaping itself (which also takes the lock).
+            match tx.send(m) {
+                Ok(()) => {}
+                Err(mpsc::error::SendError(returned)) => {
+                    map.remove(&key);
+                    pending = Some(returned);
                 }
             }
         }
+    }
+    // `rx` closed → pipeline shutting down. Dropping `workers` here releases this task's
+    // senders; each idle worker times out and reaps, and the runtime reclaims them.
+}
 
-        // Call handler (unless short-circuited)
-        let result = if let Some(r) = short_circuited {
-            r
-        } else {
-            handler.handle(payload.clone(), ctx).await
-        };
-
-        // Post-dispatch middleware chain (in reverse order)
-        let result = match result {
-            Ok(response) => {
-                let mut current = Some(response);
-                for mw in middleware.iter().rev() {
-                    let r = current.take().expect("post-dispatch: response consumed");
-                    match mw.post_dispatch(&meta, &payload, r).await {
-                        Ok(PostDispatchVerdict::PassThrough(r)) => current = Some(r),
-                        Ok(PostDispatchVerdict::Replace(r)) => {
-                            debug!(
-                                handler = %msg.target_name,
-                                "middleware replaced response"
-                            );
-                            current = Some(r);
-                        }
-                        Err(e) => {
-                            error!(
-                                handler = %msg.target_name,
-                                "middleware post-dispatch error: {e}"
-                            );
-                            // On middleware error, fall through to dispatch error
-                            current = None;
-                            break;
-                        }
-                    }
-                }
-                match current {
-                    Some(r) => Ok(r),
-                    None => Err(PipelineError::Handler(
-                        "middleware post-dispatch error".into(),
-                    )),
-                }
+/// A per-delivery-thread serial worker: processes its queue one message at a time (so
+/// same-thread dispatch is serial and ordered), and reaps itself after
+/// [`WORKER_IDLE_TIMEOUT`] of inactivity so the [`WorkerMap`] stays bounded.
+async fn serial_worker(
+    key: String,
+    mut wrx: mpsc::UnboundedReceiver<RoutedMsg>,
+    workers: WorkerMap,
+    registry: Arc<ListenerRegistry>,
+    threads: Arc<Mutex<ThreadRegistry>>,
+    reinject_tx: mpsc::Sender<Vec<u8>>,
+    middleware: Arc<Vec<Arc<dyn Middleware>>>,
+) {
+    loop {
+        match tokio::time::timeout(WORKER_IDLE_TIMEOUT, wrx.recv()).await {
+            Ok(Some(msg)) => {
+                process_message(msg, &registry, &threads, &reinject_tx, &middleware).await;
             }
-            Err(e) => Err(e),
-        };
-
-        // Provenance is CARRIED from the inbound envelope into whatever the dispatcher
-        // builds (Provenance is Copy). In Commit 1 nothing stamps new bits, so the union
-        // is just propagation; §step-4 proves it accumulates across a multi-hop chain.
-        let inbound_prov = msg.envelope.meta.provenance;
-
-        match result {
-            Ok(HandlerResponse::None) => {
-                // Synthesize ACK if a parent exists in the thread chain
-                let mut threads = threads.lock().await;
-                match threads.prune_for_response(&msg.envelope.meta.thread) {
-                    Some(prune) => {
-                        debug!(
-                            handler = %msg.target_name,
-                            target = %prune.target,
-                            "None → synthesized ACK for parent"
-                        );
-
-                        let ack = Payload::new(
-                            "ToolResponse",
-                            PayloadValue::record([
-                                ("success", PayloadValue::Boolean(true)),
-                                ("result", PayloadValue::text("ack")),
-                            ]),
-                        );
-                        let env = Envelope {
-                            meta: Meta {
-                                from: Address::flat(&msg.target_name),
-                                to: Some(Address::flat(&prune.target)),
-                                thread: prune.thread_id.clone(),
-                                provenance: inbound_prov,
-                            },
-                            payload: ack,
-                        };
-                        match encode_envelope(&env) {
-                            Ok(raw) => {
-                                if reinject_tx.send(raw).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => error!("failed to build ACK envelope: {e}"),
-                        }
+            Ok(None) => break, // all senders dropped — pipeline shutdown
+            Err(_) => {
+                // Idle. Reap under the map lock. Re-check the queue under that lock: the
+                // dispatcher enqueues under the same lock, so if a message landed after the
+                // timeout fired we see it here and keep going instead of dropping it.
+                let mut map = workers.lock().await;
+                match wrx.try_recv() {
+                    Err(mpsc::error::TryRecvError::Empty)
+                    | Err(mpsc::error::TryRecvError::Disconnected) => {
+                        map.remove(&key);
+                        break;
                     }
-                    None => {
-                        debug!(handler = %msg.target_name, "handler returned None (terminal, no parent)");
+                    Ok(msg) => {
+                        drop(map);
+                        process_message(msg, &registry, &threads, &reinject_tx, &middleware).await;
                     }
                 }
             }
-            Ok(HandlerResponse::Reply { payload }) => {
-                // Prune chain and route back to caller
-                let mut threads = threads.lock().await;
-                match threads.prune_for_response(&msg.envelope.meta.thread) {
-                    Some(prune) => {
-                        debug!(
-                            handler = %msg.target_name,
-                            target = %prune.target,
-                            "reply → pruned chain"
-                        );
+        }
+    }
+}
 
-                        // Build envelope and serialize to raw bytes (UNTRUSTED)
-                        let env = Envelope {
-                            meta: Meta {
-                                from: Address::flat(&msg.target_name),
-                                to: Some(Address::flat(&prune.target)),
-                                thread: prune.thread_id.clone(),
-                                provenance: inbound_prov,
-                            },
-                            payload,
-                        };
-                        match encode_envelope(&env) {
-                            Ok(raw) => {
-                                if reinject_tx.send(raw).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => error!("failed to build reply envelope: {e}"),
-                        }
-                    }
-                    None => {
-                        debug!(
-                            handler = %msg.target_name,
-                            "chain exhausted — reply dropped"
-                        );
-                    }
-                }
+/// Process one routed message: pre-dispatch middleware → handler → post-dispatch
+/// middleware → response handling → reinject. Runs inside a [`serial_worker`], so calls
+/// for one thread are serialized while calls across threads run concurrently.
+///
+/// Thread-registry mutations take the lock only for the mutation itself; the guard is
+/// dropped **before** the `reinject_tx.send().await` so a slow/full reinject channel can't
+/// serialize concurrent workers on the thread lock.
+async fn process_message(
+    msg: RoutedMsg,
+    registry: &Arc<ListenerRegistry>,
+    threads: &Arc<Mutex<ThreadRegistry>>,
+    reinject_tx: &mpsc::Sender<Vec<u8>>,
+    middleware: &Arc<Vec<Arc<dyn Middleware>>>,
+) {
+    let handler = match registry.get_handler(&msg.target_name) {
+        Some(h) => h,
+        None => {
+            error!(target = %msg.target_name, "handler not found (registry inconsistency)");
+            return;
+        }
+    };
+
+    let ctx = HandlerContext {
+        thread_id: msg.envelope.meta.thread.clone(),
+        from: msg.envelope.meta.from.clone(),
+        own_name: Address::flat(&msg.target_name),
+        provenance: msg.envelope.meta.provenance,
+    };
+
+    // Build dispatch metadata for middleware (name-keyed)
+    let meta = DispatchMeta {
+        from: msg.envelope.meta.from.organism().unwrap_or_default().to_string(),
+        to: msg.target_name.clone(),
+        thread_id: msg.envelope.meta.thread.clone(),
+        payload_tag: msg.payload.tag.clone(),
+    };
+
+    // Pre-dispatch middleware chain (in registration order).
+    // Payload may be transformed in-flight by middleware.
+    let mut payload = msg.payload.clone();
+    let mut short_circuited = None;
+    for mw in middleware.iter() {
+        match mw.pre_dispatch(&meta, &payload).await {
+            Ok(PreDispatchVerdict::Continue) => {}
+            Ok(PreDispatchVerdict::Transform(new_payload)) => {
+                debug!(handler = %msg.target_name, "middleware transformed payload");
+                payload = new_payload;
             }
-            Ok(HandlerResponse::Send { to, payload }) => {
-                // Forward to a target — extend chain (route by organism = listener)
-                let to_name = to.organism().unwrap_or_default().to_string();
-                let new_thread = {
-                    let mut threads = threads.lock().await;
-
-                    // Enforce peer constraints
-                    if let Err(e) = registry.routing.enforce_peers(&msg.target_name, &to_name) {
-                        warn!("{e}");
-                        continue;
-                    }
-
-                    threads.extend_chain(&msg.envelope.meta.thread, &to_name)
-                };
-
-                debug!(
-                    handler = %msg.target_name,
-                    to = %to,
-                    "send → extended chain"
-                );
-
-                // Build envelope and serialize to raw bytes (UNTRUSTED)
-                let env = Envelope {
-                    meta: Meta {
-                        from: Address::flat(&msg.target_name),
-                        to: Some(to),
-                        thread: new_thread,
-                        provenance: inbound_prov,
-                    },
-                    payload,
-                };
-                match encode_envelope(&env) {
-                    Ok(raw) => {
-                        if reinject_tx.send(raw).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => error!("failed to build send envelope: {e}"),
-                }
+            Ok(PreDispatchVerdict::ShortCircuit(response)) => {
+                debug!(handler = %msg.target_name, "middleware short-circuited dispatch");
+                short_circuited = Some(Ok(response));
+                break;
             }
             Err(e) => {
-                error!(handler = %msg.target_name, "handler error: {e}");
+                short_circuited = Some(Err(e));
+                break;
             }
         }
+    }
+
+    // Call handler (unless short-circuited)
+    let result = if let Some(r) = short_circuited {
+        r
+    } else {
+        handler.handle(payload.clone(), ctx).await
+    };
+
+    // Post-dispatch middleware chain (in reverse order).
+    let result = match result {
+        Ok(response) => {
+            let mut current = Some(response);
+            for mw in middleware.iter().rev() {
+                let r = current.take().expect("post-dispatch: response consumed");
+                match mw.post_dispatch(&meta, &payload, r).await {
+                    Ok(PostDispatchVerdict::PassThrough(r)) => current = Some(r),
+                    Ok(PostDispatchVerdict::Replace(r)) => {
+                        debug!(handler = %msg.target_name, "middleware replaced response");
+                        current = Some(r);
+                    }
+                    Err(e) => {
+                        error!(handler = %msg.target_name, "middleware post-dispatch error: {e}");
+                        // On middleware error, fall through to dispatch error
+                        current = None;
+                        break;
+                    }
+                }
+            }
+            match current {
+                Some(r) => Ok(r),
+                None => Err(PipelineError::Handler("middleware post-dispatch error".into())),
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    // Provenance is CARRIED from the inbound envelope into whatever the dispatcher builds
+    // (Provenance is Copy). In Commit 1 nothing stamps new bits, so the union is just
+    // propagation; §step-4 proves it accumulates across a multi-hop chain.
+    let inbound_prov = msg.envelope.meta.provenance;
+
+    match result {
+        Ok(HandlerResponse::None) => {
+            // Synthesize ACK if a parent exists in the thread chain. Take the lock only to
+            // prune, then release it before building/reinjecting.
+            let prune = {
+                let mut threads = threads.lock().await;
+                threads.prune_for_response(&msg.envelope.meta.thread)
+            };
+            match prune {
+                Some(prune) => {
+                    debug!(handler = %msg.target_name, target = %prune.target, "None → synthesized ACK for parent");
+                    let ack = Payload::new(
+                        "ToolResponse",
+                        PayloadValue::record([
+                            ("success", PayloadValue::Boolean(true)),
+                            ("result", PayloadValue::text("ack")),
+                        ]),
+                    );
+                    let env = Envelope {
+                        meta: Meta {
+                            from: Address::flat(&msg.target_name),
+                            to: Some(Address::flat(&prune.target)),
+                            thread: prune.thread_id.clone(),
+                            provenance: inbound_prov,
+                        },
+                        payload: ack,
+                    };
+                    match encode_envelope(&env) {
+                        Ok(raw) => {
+                            let _ = reinject_tx.send(raw).await;
+                        }
+                        Err(e) => error!("failed to build ACK envelope: {e}"),
+                    }
+                }
+                None => debug!(handler = %msg.target_name, "handler returned None (terminal, no parent)"),
+            }
+        }
+        Ok(HandlerResponse::Reply { payload }) => {
+            let prune = {
+                let mut threads = threads.lock().await;
+                threads.prune_for_response(&msg.envelope.meta.thread)
+            };
+            match prune {
+                Some(prune) => {
+                    debug!(handler = %msg.target_name, target = %prune.target, "reply → pruned chain");
+                    // Build envelope and serialize to raw bytes (UNTRUSTED)
+                    let env = Envelope {
+                        meta: Meta {
+                            from: Address::flat(&msg.target_name),
+                            to: Some(Address::flat(&prune.target)),
+                            thread: prune.thread_id.clone(),
+                            provenance: inbound_prov,
+                        },
+                        payload,
+                    };
+                    match encode_envelope(&env) {
+                        Ok(raw) => {
+                            let _ = reinject_tx.send(raw).await;
+                        }
+                        Err(e) => error!("failed to build reply envelope: {e}"),
+                    }
+                }
+                None => debug!(handler = %msg.target_name, "chain exhausted — reply dropped"),
+            }
+        }
+        Ok(HandlerResponse::Send { to, payload }) => {
+            // Forward to a target — extend chain (route by organism = listener).
+            // Peer enforcement uses the routing table only, so it needs no thread lock.
+            let to_name = to.organism().unwrap_or_default().to_string();
+            if let Err(e) = registry.routing.enforce_peers(&msg.target_name, &to_name) {
+                warn!("{e}");
+                return;
+            }
+            let new_thread = {
+                let mut threads = threads.lock().await;
+                threads.extend_chain(&msg.envelope.meta.thread, &to_name)
+            };
+            debug!(handler = %msg.target_name, to = %to, "send → extended chain");
+            // Build envelope and serialize to raw bytes (UNTRUSTED)
+            let env = Envelope {
+                meta: Meta {
+                    from: Address::flat(&msg.target_name),
+                    to: Some(to),
+                    thread: new_thread,
+                    provenance: inbound_prov,
+                },
+                payload,
+            };
+            match encode_envelope(&env) {
+                Ok(raw) => {
+                    let _ = reinject_tx.send(raw).await;
+                }
+                Err(e) => error!("failed to build send envelope: {e}"),
+            }
+        }
+        Err(e) => error!(handler = %msg.target_name, "handler error: {e}"),
     }
 }
 
@@ -1070,6 +1149,110 @@ mod tests {
         let msgs = received.lock().await;
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("works"));
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_concurrent_across_threads() {
+        // One listener ("bob"), two delivery threads ("alice", "carol"). Each handler call
+        // holds for a beat; with per-thread workers they must overlap → max concurrency 2.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let p = peak.clone();
+
+        let bob = FnHandler(move |_p: ValidatedPayload, _ctx: HandlerContext| {
+            let a = a.clone();
+            let p = p.clone();
+            Box::pin(async move {
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("bob", "Greeting", bob, false, vec![], "Bob", None);
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.run();
+
+        pipeline
+            .inject(inbound("ext", "bob", "alice", Payload::single("Greeting", "text", "x")))
+            .await
+            .unwrap();
+        pipeline
+            .inject(inbound("ext", "bob", "carol", Payload::single("Greeting", "text", "y")))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "different threads (bob[alice], bob[carol]) must run concurrently"
+        );
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_serial_and_ordered_within_thread() {
+        // Two messages on the SAME delivery thread must never overlap (peak concurrency 1)
+        // and must run in arrival order — the bob[alice] state-safety invariant.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let a = active.clone();
+        let p = peak.clone();
+        let o = order.clone();
+
+        let bob = FnHandler(move |payload: ValidatedPayload, _ctx: HandlerContext| {
+            let a = a.clone();
+            let p = p.clone();
+            let o = o.clone();
+            Box::pin(async move {
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                o.lock().await.push(text_of(&payload));
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        registry.register("bob", "Greeting", bob, false, vec![], "Bob", None);
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.run();
+
+        pipeline
+            .inject(inbound("ext", "bob", "alice", Payload::single("Greeting", "text", "first")))
+            .await
+            .unwrap();
+        pipeline
+            .inject(inbound("ext", "bob", "alice", Payload::single("Greeting", "text", "second")))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "same thread must be serialized — never two handlers at once for one instance"
+        );
+        assert_eq!(
+            *order.lock().await,
+            vec!["first".to_string(), "second".to_string()],
+            "same-thread messages must run in arrival order"
+        );
 
         pipeline.shutdown().await;
     }
