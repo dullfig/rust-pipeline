@@ -29,7 +29,7 @@ use crate::handler::{HandlerContext, HandlerResponse, ValidatedPayload};
 use crate::middleware::{DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict};
 use crate::registry::ListenerRegistry;
 use crate::thread::ThreadRegistry;
-use crate::wire::{Address, Envelope, Meta, Payload, PayloadValue};
+use crate::wire::{Address, Envelope, Meta, Payload, PayloadValue, Provenance};
 
 /// Channel buffer size for inter-stage communication.
 const CHANNEL_BUFFER: usize = 256;
@@ -284,6 +284,94 @@ impl Pipeline {
     /// Get a clone of the ingress sender (for external use).
     pub fn ingress_tx(&self) -> mpsc::Sender<Vec<u8>> {
         self.ingress_tx.clone()
+    }
+
+    /// Get a [`ThreadFailer`] handle — the recovery half of [`DispatchObserver`], used to
+    /// time out a hung call edge by injecting a failure back to the waiting caller.
+    ///
+    /// Clonable; move it into a host watchdog task. **Call after [`run`](Self::run)** — like
+    /// [`ingress_tx`](Self::ingress_tx), it captures the live ingress channel that `run`
+    /// installs.
+    pub fn thread_failer(&self) -> ThreadFailer {
+        ThreadFailer {
+            threads: self.threads.clone(),
+            ingress: self.ingress_tx.clone(),
+        }
+    }
+}
+
+/// The recovery half of [`DispatchObserver`]: a cheaply-clonable handle for **failing an
+/// in-flight call edge**.
+///
+/// A host watchdog observes a call edge open via [`DispatchObserver::on_open`] (which carries
+/// the edge's `thread`), applies its own deadline, and — when the edge overruns — calls
+/// [`ThreadFailer::fail`] with that `thread`. The pipeline then prunes the chain back to the
+/// **waiting caller** and delivers a `Timeout` payload as if the callee had failed, so the
+/// caller unblocks (a suspended `Send`) or gets a callback (an async `Spawn`) instead of
+/// hanging forever on a reply that will never come.
+///
+/// The decision to time out — the deadline, the policy — stays the host's (reliability above
+/// the wire). This handle is only the *mechanism* to inject the failure through the chain the
+/// pipeline owns, so the host doesn't reconstruct that bookkeeping.
+#[derive(Clone)]
+pub struct ThreadFailer {
+    threads: Arc<Mutex<ThreadRegistry>>,
+    ingress: mpsc::Sender<Vec<u8>>,
+}
+
+impl ThreadFailer {
+    /// Fail the call edge identified by `thread_id` (the thread reported to
+    /// [`DispatchObserver::on_open`]): prune the chain back to the waiting caller and deliver
+    /// a `Timeout` payload carrying `reason`, as if the callee had replied with a failure.
+    ///
+    /// Returns `Ok(true)` if a waiting caller was found and the failure delivered, `Ok(false)`
+    /// if the thread had no waiting caller (already resolved, or unknown/stale).
+    ///
+    /// It also **neutralizes a late real reply**: the edge's thread is cleaned up, so if the
+    /// hung callee later un-hangs and replies, that reply finds no chain and is dropped — the
+    /// caller never receives both a timeout *and* a duplicate real answer. The `Timeout` is
+    /// re-injected as untrusted bytes through the normal gauntlet like any other message; the
+    /// caller must have a route registered for the `Timeout` tag (the host's job, exactly as
+    /// it registers agents to receive replies).
+    pub async fn fail(&self, thread_id: &str, reason: &str) -> Result<bool, PipelineError> {
+        let (prune, callee) = {
+            let mut threads = self.threads.lock().await;
+            // The last chain segment is the callee that hung — used as the `Timeout`'s
+            // `from`, so the caller sees the timeout attributed to the peer it called.
+            let callee = threads
+                .lookup(thread_id)
+                .and_then(|chain| chain.rsplit('.').next())
+                .unwrap_or("system")
+                .to_string();
+            let prune = threads.prune_for_response(thread_id);
+            // Drop this edge's thread so a late reply from the hung callee is dropped.
+            threads.cleanup(thread_id);
+            (prune, callee)
+        };
+
+        let prune = match prune {
+            Some(p) => p,
+            None => return Ok(false), // no waiting caller — nothing to fail
+        };
+
+        let env = Envelope {
+            meta: Meta {
+                from: Address::flat(&callee),
+                to: Some(Address::flat(&prune.target)),
+                thread: prune.thread_id,
+                provenance: Provenance::EMPTY,
+            },
+            payload: Payload::new(
+                "Timeout",
+                PayloadValue::record([("reason", PayloadValue::text(reason))]),
+            ),
+        };
+        let raw = encode_envelope(&env)?;
+        self.ingress
+            .send(raw)
+            .await
+            .map_err(|_| PipelineError::Handler("pipeline shut down".into()))?;
+        Ok(true)
     }
 }
 
@@ -1574,6 +1662,104 @@ mod tests {
         assert_eq!((opens[0].0.as_str(), opens[0].1.as_str(), opens[0].3), ("parent", "child", CallKind::Sync));
         let closes = observer.closes.lock().unwrap().clone();
         assert!(closes.contains(&opens[0].2), "the sync edge should close when child replies");
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fail_thread_times_out_hung_send_and_drops_late_reply() {
+        // bob does a synchronous Send to a travelagent that hangs (replies late). A host
+        // watchdog observes the open edge and fails it via ThreadFailer → bob gets a Timeout
+        // and unblocks; the travelagent's eventual late reply is dropped (no duplicate).
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct Opens {
+            threads: StdMutex<Vec<String>>,
+        }
+        impl DispatchObserver for Opens {
+            fn on_open(&self, _caller: &str, _callee: &str, thread: &str, _kind: CallKind) {
+                self.threads.lock().unwrap().push(thread.to_string());
+            }
+            fn on_close(&self, _thread: &str) {}
+        }
+
+        // Everything bob receives, in order — so a leaked late reply would show up.
+        let got = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let g = got.clone();
+        let bob = FnHandler(move |p: ValidatedPayload, _ctx: HandlerContext| {
+            let g = g.clone();
+            Box::pin(async move {
+                let entry = match p.tag.as_str() {
+                    "Timeout" => format!(
+                        "Timeout:{}",
+                        p.value.get("reason").and_then(|v| v.as_text()).unwrap_or("")
+                    ),
+                    other => other.to_string(),
+                };
+                g.lock().unwrap().push(entry);
+                let r = match p.tag.as_str() {
+                    "Book" => HandlerResponse::Send {
+                        to: "travelagent".into(),
+                        payload: Payload::single("Find", "x", "go"),
+                    },
+                    _ => HandlerResponse::None,
+                };
+                Ok(r) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        // travelagent hangs, then replies late (as a ToolResponse) — must be dropped.
+        let travelagent = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok(HandlerResponse::Reply {
+                    payload: Payload::single("ToolResponse", "result", "late ticket"),
+                }) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        let bob_peers = vec!["travelagent".to_string()];
+        registry.register("bob", "Book", bob, true, bob_peers.clone(), "Bob", None);
+        registry.routing.register("bob", "Timeout", true, bob_peers.clone(), "Bob");
+        // Route ToolResponse to bob too, so a leaked late reply WOULD reach (and be recorded
+        // by) him — the test's guard that the late reply is actually dropped.
+        registry.routing.register("bob", "ToolResponse", true, bob_peers, "Bob");
+        registry.register("travelagent", "Find", travelagent, false, vec![], "TravelAgent", None);
+
+        let observer = Arc::new(Opens::default());
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.with_dispatch_observer(observer.clone());
+        pipeline.run();
+        let failer = pipeline.thread_failer();
+
+        pipeline
+            .inject(inbound("user", "bob", "T0", Payload::single("Book", "x", "SFO-JFK")))
+            .await
+            .unwrap();
+
+        // Let the edge open (bob dispatches to travelagent), then time it out.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let edge = observer.threads.lock().unwrap()[0].clone();
+        let failed = failer
+            .fail(&edge, "travelagent did not respond in time")
+            .await
+            .unwrap();
+        assert!(failed, "fail should find the waiting caller and deliver the timeout");
+
+        // Wait past travelagent's late reply (300ms) to confirm it's dropped.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let msgs = got.lock().unwrap().clone();
+        assert_eq!(
+            msgs,
+            vec![
+                "Book".to_string(),
+                "Timeout:travelagent did not respond in time".to_string(),
+            ],
+            "bob should see Book then the Timeout, and NOT the late ToolResponse, got {msgs:?}"
+        );
 
         pipeline.shutdown().await;
     }
