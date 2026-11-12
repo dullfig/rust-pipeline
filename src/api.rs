@@ -48,12 +48,21 @@ pub use crate::pipeline::Pipeline;
 /// * `register(.., payload_tag, ..)` - the payload tag this listener accepts
 /// * `register(.., handler, ..)` - anything implementing [`Handler`]
 /// * `register(.., is_agent, ..)` - agents are peer-restricted: they may only message `peers`
-/// * `register(.., peers, ..)` - names an agent may send to (empty = no one; deny by default)
+/// * `register(.., peers, ..)` - a `Vec<String>` of names an agent may send to
+///   (`vec![]` = no one; deny by default)
 /// * `register(.., description, ..)` - human-readable purpose
 /// * `register(.., schema)` - optional [`PayloadSchema`] enforced before dispatch
 ///
+/// # Returns
+/// `register` returns nothing; the listener is stored in the registry.
+///
 /// # Errors
 /// Registration cannot fail; registering the same name again replaces the handler.
+///
+/// # Example
+/// ```ignore
+/// registry.register("greeter", "greet", handler, false, vec![], "Greets callers", None);
+/// ```
 pub use crate::registry::ListenerRegistry;
 
 /// Thread registry: maps opaque thread UUIDs to dot-separated call chains
