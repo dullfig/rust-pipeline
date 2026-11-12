@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::envelope::ThreadId;
+use crate::wire::Provenance;
 
 /// Bidirectional mapping between UUIDs and dot-separated call chains.
 ///
@@ -34,6 +35,9 @@ pub struct ThreadRegistry {
     root_uuid: Option<String>,
     /// Root chain string
     root_chain: String,
+    /// Provenance each open call edge (UUID) was opened with — so a synthesized failure
+    /// on that edge (ThreadFailer's `Timeout`) carries the same labels a real reply would.
+    edge_provenance: HashMap<String, Provenance>,
 }
 
 /// Result of pruning a thread chain for a response.
@@ -52,6 +56,7 @@ impl ThreadRegistry {
             uuid_to_chain: HashMap::new(),
             root_uuid: None,
             root_chain: "system".into(),
+            edge_provenance: HashMap::new(),
         }
     }
 
@@ -204,11 +209,29 @@ impl ThreadRegistry {
         })
     }
 
+    /// Record the provenance a call edge was opened with. Unions into any existing entry
+    /// (a reused chain UUID over-taints rather than leaks).
+    pub fn record_edge_provenance(&mut self, thread_id: &str, provenance: Provenance) {
+        self.edge_provenance
+            .entry(thread_id.to_string())
+            .or_insert(Provenance::EMPTY)
+            .union_with(provenance);
+    }
+
+    /// The provenance recorded for a call edge, or EMPTY if none was recorded.
+    pub fn edge_provenance(&self, thread_id: &str) -> Provenance {
+        self.edge_provenance
+            .get(thread_id)
+            .copied()
+            .unwrap_or(Provenance::EMPTY)
+    }
+
     /// Explicitly clean up a thread UUID.
     pub fn cleanup(&mut self, thread_id: &str) {
         if let Some(chain) = self.uuid_to_chain.remove(thread_id) {
             self.chain_to_uuid.remove(&chain);
         }
+        self.edge_provenance.remove(thread_id);
     }
 
     /// Return current mappings for debugging.
@@ -220,6 +243,7 @@ impl ThreadRegistry {
     pub fn clear(&mut self) {
         self.chain_to_uuid.clear();
         self.uuid_to_chain.clear();
+        self.edge_provenance.clear();
         self.root_uuid = None;
         self.root_chain = "system".into();
     }
