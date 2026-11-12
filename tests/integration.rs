@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use rust_pipeline::prelude::*;
+use rust_pipeline::config::parse_config; // config is internal (not in api)
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

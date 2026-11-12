@@ -61,46 +61,40 @@
 //! # }
 //! ```
 
+pub mod api;
+
+// Internal modules. Still `pub` so existing callers keep compiling while they migrate to
+// `api`, but hidden from docs and NOT part of the contract — import from `api` instead.
+#[doc(hidden)]
 pub mod codec;
+#[doc(hidden)]
 pub mod config;
+#[doc(hidden)]
 pub mod envelope;
+#[doc(hidden)]
 pub mod federation;
+#[doc(hidden)]
 pub mod error;
+#[doc(hidden)]
 pub mod handler;
+#[doc(hidden)]
 pub mod middleware;
+#[doc(hidden)]
 pub mod pipeline;
+#[doc(hidden)]
 pub mod registry;
+#[doc(hidden)]
 pub mod routing;
+#[doc(hidden)]
 pub mod switchboard;
+#[doc(hidden)]
 pub mod thread;
+#[doc(hidden)]
 pub mod validation;
+#[doc(hidden)]
 pub mod wire;
 
-/// Convenient re-exports for common usage.
+/// Glob-import convenience: exactly the [`api`] surface.
 pub mod prelude {
-    pub use crate::codec::{decode_envelope, encode_envelope};
-    pub use crate::config::{load_config, parse_config, ListenerConfig, PipelineConfig};
-    pub use crate::envelope::{AgentId, ThreadId, ENVELOPE_NS};
-    pub use crate::error::{PipelineError, PipelineResult};
-    pub use crate::federation::{
-        open, seal, AllowAll, Authorizer, FederationEgress, FederationError, FederationServer,
-        LocalDelivery, Peer, PeerDirectory, PeerKey, Transport,
-    };
-    pub use crate::wire::{
-        Address, Envelope, Field, Meta, Payload, PayloadValue, Provenance, Segment,
-    };
-    pub use crate::handler::{
-        FnHandler, Handler, HandlerContext, HandlerResponse, HandlerResult, ValidatedPayload,
-    };
-    pub use crate::middleware::{
-        DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict,
-    };
-    pub use crate::pipeline::{CallKind, DispatchObserver, Pipeline, ThreadFailer};
-    pub use crate::registry::ListenerRegistry;
-    pub use crate::routing::RoutingTable;
-    pub use crate::switchboard::{Materializer, Switchboard, SwitchboardError};
-    pub use crate::thread::ThreadRegistry;
-    pub use crate::validation::{
-        FieldSchema, FieldType, PayloadSchema, SchemaRegistry,
-    };
+    pub use crate::api::*;
 }
