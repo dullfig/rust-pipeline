@@ -29,7 +29,7 @@ use crate::handler::{HandlerContext, HandlerResponse, ValidatedPayload};
 use crate::middleware::{DispatchMeta, Middleware, PostDispatchVerdict, PreDispatchVerdict};
 use crate::registry::ListenerRegistry;
 use crate::thread::ThreadRegistry;
-use crate::wire::{Address, Envelope, Meta, Payload, PayloadValue, Provenance};
+use crate::wire::{Address, Envelope, Meta, Payload, PayloadValue};
 
 /// Channel buffer size for inter-stage communication.
 const CHANNEL_BUFFER: usize = 256;
@@ -334,8 +334,11 @@ impl ThreadFailer {
     /// caller must have a route registered for the `Timeout` tag (the host's job, exactly as
     /// it registers agents to receive replies).
     pub async fn fail(&self, thread_id: &str, reason: &str) -> Result<bool, PipelineError> {
-        let (prune, callee) = {
+        let (prune, callee, provenance) = {
             let mut threads = self.threads.lock().await;
+            // The labels the edge was opened with — read before cleanup drops them, so the
+            // Timeout carries them like a real reply would (a timeout must not launder).
+            let provenance = threads.edge_provenance(thread_id);
             // The last chain segment is the callee that hung — used as the `Timeout`'s
             // `from`, so the caller sees the timeout attributed to the peer it called.
             let callee = threads
@@ -346,7 +349,7 @@ impl ThreadFailer {
             let prune = threads.prune_for_response(thread_id);
             // Drop this edge's thread so a late reply from the hung callee is dropped.
             threads.cleanup(thread_id);
-            (prune, callee)
+            (prune, callee, provenance)
         };
 
         let prune = match prune {
@@ -359,7 +362,7 @@ impl ThreadFailer {
                 from: Address::flat(&callee),
                 to: Some(Address::flat(&prune.target)),
                 thread: prune.thread_id,
-                provenance: Provenance::EMPTY,
+                provenance,
             },
             payload: Payload::new(
                 "Timeout",
@@ -802,7 +805,9 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
                 Ok(()) => {
                     let obligation_thread = {
                         let mut threads = threads.lock().await;
-                        threads.extend_chain(&msg.envelope.meta.thread, &to_name)
+                        let t = threads.extend_chain(&msg.envelope.meta.thread, &to_name);
+                        threads.record_edge_provenance(&t, inbound_prov);
+                        t
                     };
                     let work = Envelope {
                         meta: Meta {
@@ -867,7 +872,9 @@ async fn process_message(msg: RoutedMsg, ctx: &DispatchCtx) {
             }
             let new_thread = {
                 let mut threads = threads.lock().await;
-                threads.extend_chain(&msg.envelope.meta.thread, &to_name)
+                let t = threads.extend_chain(&msg.envelope.meta.thread, &to_name);
+                threads.record_edge_provenance(&t, inbound_prov);
+                t
             };
             debug!(handler = %msg.target_name, to = %to, "send → extended chain (sync sub-call)");
             // Build envelope and serialize to raw bytes (UNTRUSTED)
@@ -1760,6 +1767,89 @@ mod tests {
             ],
             "bob should see Book then the Timeout, and NOT the late ToolResponse, got {msgs:?}"
         );
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fail_thread_timeout_carries_edge_provenance() {
+        // A timeout must not launder the thread's labels: the Timeout delivered to the
+        // waiting caller carries the provenance the call edge was opened with, exactly as a
+        // real reply would. Otherwise the caller's next Send/Reply would go out EMPTY.
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct Opens {
+            threads: StdMutex<Vec<String>>,
+        }
+        impl DispatchObserver for Opens {
+            fn on_open(&self, _caller: &str, _callee: &str, thread: &str, _kind: CallKind) {
+                self.threads.lock().unwrap().push(thread.to_string());
+            }
+            fn on_close(&self, _thread: &str) {}
+        }
+
+        // Provenance bob sees on each delivery, by tag.
+        let seen = Arc::new(StdMutex::new(Vec::<(String, Provenance)>::new()));
+        let s = seen.clone();
+        let bob = FnHandler(move |p: ValidatedPayload, ctx: HandlerContext| {
+            let s = s.clone();
+            Box::pin(async move {
+                s.lock().unwrap().push((p.tag.clone(), ctx.provenance));
+                let r = match p.tag.as_str() {
+                    "Book" => HandlerResponse::Send {
+                        to: "travelagent".into(),
+                        payload: Payload::single("Find", "x", "go"),
+                    },
+                    _ => HandlerResponse::None,
+                };
+                Ok(r) as Result<HandlerResponse, PipelineError>
+            })
+        });
+        // travelagent never answers in time.
+        let travelagent = FnHandler(|_p: ValidatedPayload, _ctx: HandlerContext| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(HandlerResponse::None) as Result<HandlerResponse, PipelineError>
+            })
+        });
+
+        let mut registry = ListenerRegistry::new();
+        let bob_peers = vec!["travelagent".to_string()];
+        registry.register("bob", "Book", bob, true, bob_peers.clone(), "Bob", None);
+        registry.routing.register("bob", "Timeout", true, bob_peers, "Bob");
+        registry.register("travelagent", "Find", travelagent, false, vec![], "TravelAgent", None);
+
+        let observer = Arc::new(Opens::default());
+        let mut pipeline = Pipeline::new(registry, ThreadRegistry::new());
+        pipeline.with_dispatch_observer(observer.clone());
+        pipeline.run();
+        let failer = pipeline.thread_failer();
+
+        let labelled = Provenance::from_bit(1).with_bit(3);
+        let raw = encode_envelope(&Envelope {
+            meta: Meta {
+                from: "user".into(),
+                to: Some("bob".into()),
+                thread: "T0".into(),
+                provenance: labelled,
+            },
+            payload: Payload::single("Book", "x", "SFO-JFK"),
+        })
+        .unwrap();
+        pipeline.inject(raw).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let edge = observer.threads.lock().unwrap()[0].clone();
+        assert!(failer.fail(&edge, "too slow").await.unwrap());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let seen = seen.lock().unwrap().clone();
+        let timeout = seen
+            .iter()
+            .find(|(tag, _)| tag == "Timeout")
+            .unwrap_or_else(|| panic!("bob never got the Timeout, saw {seen:?}"));
+        assert_eq!(timeout.1, labelled, "Timeout must carry the edge's provenance");
 
         pipeline.shutdown().await;
     }
