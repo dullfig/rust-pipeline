@@ -6,7 +6,8 @@
 //! change without notice — import from `rust_pipeline::api` (or the prelude, which is
 //! this module re-exported).
 //!
-//! Every item is a re-export: this file moves no code, it only draws the boundary.
+//! Every item is a re-export or a one-line wrapper: this file moves no code, it only draws
+//! the boundary.
 //!
 //! ```text
 //! [Raw Bytes] → decode → validate(schema) → route → enforce(peers) → dispatch(handler)
@@ -41,13 +42,13 @@ pub use crate::pipeline::Pipeline;
 /// listener; the routing key is `name.payload_tag` (lowercase).
 ///
 /// # Arguments
-/// * `name` - listener name, used as the address segment
-/// * `payload_tag` - the payload tag this listener accepts
-/// * `handler` - anything implementing [`Handler`]
-/// * `is_agent` - agents are peer-restricted: they may only message `peers`
-/// * `peers` - listener names an agent may send to (empty = no one; deny by default)
-/// * `description` - human-readable purpose
-/// * `schema` - optional [`PayloadSchema`] enforced before dispatch
+/// * `register(name, ..)` - listener name, used as the address segment
+/// * `register(.., payload_tag, ..)` - the payload tag this listener accepts
+/// * `register(.., handler, ..)` - anything implementing [`Handler`]
+/// * `register(.., is_agent, ..)` - agents are peer-restricted: they may only message `peers`
+/// * `register(.., peers, ..)` - names an agent may send to (empty = no one; deny by default)
+/// * `register(.., description, ..)` - human-readable purpose
+/// * `register(.., schema)` - optional [`PayloadSchema`] enforced before dispatch
 ///
 /// # Errors
 /// Registration cannot fail; registering the same name again replaces the handler.
@@ -85,8 +86,8 @@ pub use crate::error::PipelineResult;
 /// runs it through the full gauntlet again.
 ///
 /// # Arguments
-/// * `payload` - the validated payload ([`ValidatedPayload`])
-/// * `ctx` - pipeline-verified metadata ([`HandlerContext`])
+/// * `handle(payload, ..)` - the validated payload ([`ValidatedPayload`])
+/// * `handle(.., ctx)` - pipeline-verified metadata ([`HandlerContext`])
 ///
 /// # Returns
 /// A [`HandlerResult`] carrying the [`HandlerResponse`].
@@ -145,8 +146,8 @@ pub use crate::handler::ValidatedPayload;
 /// replace the handler's response. Both default to pass-through.
 ///
 /// # Arguments
-/// * `meta` - [`DispatchMeta`] for the message
-/// * the payload (pre) or the handler's result (post)
+/// * `pre_dispatch(meta, ..)` / `post_dispatch(meta, ..)` - [`DispatchMeta`] for the message
+/// * `pre_dispatch(.., payload)` / `post_dispatch(.., result)` - the payload, or the handler's result
 ///
 /// # Returns
 /// A [`PreDispatchVerdict`] or [`PostDispatchVerdict`].
@@ -175,9 +176,9 @@ pub use crate::middleware::PostDispatchVerdict;
 /// dispatch and must be cheap.
 ///
 /// # Arguments
-/// * `caller`, `callee` - the two ends of the edge
-/// * `thread` - the thread the response is expected on
-/// * `kind` - [`CallKind`]
+/// * `on_open(caller, callee, ..)` - the two ends of the edge
+/// * `on_open(.., thread, ..)` / `on_close(thread)` - the thread the response is expected on
+/// * `on_open(.., kind)` - [`CallKind`]
 ///
 /// # Errors
 /// Callbacks return nothing and cannot fail the pipeline.
@@ -260,7 +261,9 @@ pub use crate::wire::Provenance;
 ///
 /// # Errors
 /// `PipelineError::Serialization` when the envelope cannot be written.
-pub use crate::codec::encode_envelope;
+pub fn encode_envelope(env: &Envelope) -> PipelineResult<Vec<u8>> {
+    crate::codec::encode_envelope(env)
+}
 
 /// Decodes wire bytes into a typed envelope.
 ///
@@ -275,7 +278,9 @@ pub use crate::codec::encode_envelope;
 /// # Errors
 /// `PipelineError::EnvelopeParse`, `MissingMeta` or `Xml` when the bytes are not a valid
 /// envelope.
-pub use crate::codec::decode_envelope;
+pub fn decode_envelope(raw: &[u8]) -> PipelineResult<Envelope> {
+    crate::codec::decode_envelope(raw)
+}
 
 // ── Schemas ──────────────────────────────────────────────────────────
 
@@ -309,7 +314,9 @@ pub use crate::validation::SchemaRegistry;
 /// `PipelineError::Validation` describing the first mismatch (wrong root, missing
 /// required field, unexpected field under `strict`), or `PipelineError::Xml` for
 /// malformed bytes.
-pub use crate::validation::validate_payload;
+pub fn validate_payload(payload_xml: &[u8], schema: &PayloadSchema) -> PipelineResult<()> {
+    crate::validation::validate_payload(payload_xml, schema)
+}
 
 // ── Instance routing ─────────────────────────────────────────────────
 
@@ -353,11 +360,13 @@ pub use crate::switchboard::SwitchboardError;
 /// federation-egress channel.
 ///
 /// # Arguments
-/// * `node` - this node's namespace
-/// * `directory` - the known peers
-/// * `transport` - moves sealed frames ([`Transport`])
-/// * `local` - where opened envelopes go ([`LocalDelivery`])
-/// * `authorizer` - decides whether an authenticated origin may reach its target ([`Authorizer`])
+/// * `new(node, ..)` - this node's namespace
+/// * `new(.., directory, ..)` - the known peers
+/// * `new(.., transport, ..)` - moves sealed frames ([`Transport`])
+/// * `new(.., local, ..)` - where opened envelopes go ([`LocalDelivery`])
+/// * `new(.., authorizer)` - may an authenticated origin reach its target ([`Authorizer`])
+/// * `send(envelope)` - an envelope addressed to a registered remote node
+/// * `receive(frame)` - a sealed frame from the transport
 ///
 /// # Errors
 /// `send` and `receive` return [`FederationError`] (unknown peer, bad frame, failed
@@ -395,8 +404,8 @@ pub use crate::federation::PeerKey;
 /// before local delivery; rejection fails closed.
 ///
 /// # Arguments
-/// * `from` - the authenticated origin address
-/// * `to` - the target address
+/// * `authorize(from, ..)` - the authenticated origin address
+/// * `authorize(.., to)` - the target address
 ///
 /// # Errors
 /// Return `Err(reason)` to refuse; surfaced as `FederationError::Unauthorized`.
@@ -421,7 +430,9 @@ pub use crate::federation::FederationError;
 /// # Errors
 /// `FederationError::Codec` when encoding fails, `FederationError::Nonce` when no nonce
 /// can be generated, `FederationError::OpenFailed` when encryption fails.
-pub use crate::federation::seal;
+pub fn seal(envelope: &Envelope, sender: &str, key: &PeerKey) -> Result<Vec<u8>, FederationError> {
+    crate::federation::seal(envelope, sender, key)
+}
 
 /// Opens a sealed frame, authenticating the sender against the peer directory.
 ///
@@ -435,4 +446,6 @@ pub use crate::federation::seal;
 /// # Errors
 /// `FederationError::UnknownPeer`, `MalformedFrame`, `UnsupportedVersion`,
 /// `UnsupportedAuth`, `OpenFailed` (wrong key or tampering) or `Codec`.
-pub use crate::federation::open;
+pub fn open(frame: &[u8], directory: &PeerDirectory) -> Result<(Envelope, String), FederationError> {
+    crate::federation::open(frame, directory)
+}
