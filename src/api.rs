@@ -19,9 +19,11 @@
 
 /// The self-feeding pipeline: four tokio stages joined by bounded channels.
 ///
-/// Build it with `Pipeline::new(registry, threads)`, install hooks
-/// (`add_middleware`, `with_dispatch_observer`, `with_federation`) **before** `run()`,
-/// then feed it with `inject(raw_bytes)` and stop it with `shutdown()`.
+/// Build it with `let mut p = Pipeline::new(registry, threads)`, install hooks
+/// (`add_middleware`, `with_dispatch_observer`, `with_federation`) **before** `p.run()`
+/// (needs `&mut`, must be inside a tokio runtime), then feed it with
+/// `p.inject(raw_bytes).await` and stop it with `p.shutdown().await` (consumes it).
+/// `inject` and `shutdown` are `async`.
 ///
 /// # Arguments
 /// * `new(registry, threads)` - the listeners to dispatch to and the thread state to use
@@ -184,8 +186,11 @@ pub use crate::middleware::PostDispatchVerdict;
 /// Callbacks return nothing and cannot fail the pipeline.
 pub use crate::pipeline::DispatchObserver;
 
-/// Whether an in-flight call edge is a synchronous `Send` (caller suspended) or an async
-/// `Spawn` (caller continues, awaits a callback).
+/// Whether an in-flight call edge is synchronous or asynchronous.
+///
+/// Variants: `CallKind::Sync` — opened by a `HandlerResponse::Send` (caller suspended until
+/// the reply); `CallKind::Async` — opened by a `HandlerResponse::Spawn` (caller continues,
+/// receives a callback later).
 pub use crate::pipeline::CallKind;
 
 /// The recovery half of [`DispatchObserver`]: injects a `Timeout` back to the caller
@@ -195,6 +200,7 @@ pub use crate::pipeline::CallKind;
 ///
 /// # Arguments
 /// * `fail(thread_id, reason)` - the hung edge's thread and a human-readable reason
+///   (`async`: `failer.fail(thread_id, reason).await`)
 ///
 /// # Returns
 /// `Ok(true)` if a waiting caller was failed, `Ok(false)` if the thread had none
@@ -323,7 +329,8 @@ pub fn validate_payload(payload_xml: &[u8], schema: &PayloadSchema) -> PipelineR
 /// Materialize-then-inject front over a pipeline's ingress.
 ///
 /// `Switchboard::new(materializer, pipeline.ingress_tx())`, then `route(envelope)`
-/// resolves the destination instance, stamps its thread and injects.
+/// resolves the destination instance, stamps its thread and injects. `route` is `async`:
+/// `switchboard.route(envelope).await`.
 ///
 /// # Arguments
 /// * `route(envelope)` - an envelope whose `meta.to` names the destination
@@ -348,6 +355,9 @@ pub use crate::switchboard::Switchboard;
 pub use crate::switchboard::Materializer;
 
 /// Why [`Switchboard::route`] failed.
+///
+/// Variants: `NoDestination` (no `meta.to`), `Materialize(String)` (the
+/// [`Materializer`] refused), `IngressClosed`, `Encode(PipelineError)`.
 pub use crate::switchboard::SwitchboardError;
 
 // ── Federation ───────────────────────────────────────────────────────
@@ -356,8 +366,8 @@ pub use crate::switchboard::SwitchboardError;
 /// stamps and locally delivers inbound frames.
 ///
 /// `FederationServer::new(node, directory, transport, local, authorizer)`; then
-/// `send(envelope)`, `receive(frame)`, and `run_egress(rx)` to drain the pipeline's
-/// federation-egress channel.
+/// `send(envelope).await`, `receive(frame).await`, and `run_egress(rx).await` to drain the
+/// pipeline's federation-egress channel (all three are `async`).
 ///
 /// # Arguments
 /// * `new(node, ..)` - this node's namespace
@@ -415,6 +425,10 @@ pub use crate::federation::Authorizer;
 pub use crate::federation::AllowAll;
 
 /// Everything that can go wrong at the federation boundary.
+///
+/// Variants: `UnknownPeer(String)`, `MalformedFrame`, `UnsupportedVersion(u8)`,
+/// `UnsupportedAuth(u8)`, `OpenFailed`, `Nonce`, `NoDestination`, `NotRemote(String)`,
+/// `Transport(String)`, `Delivery(String)`, `Unauthorized(String)`, `Codec(PipelineError)`.
 pub use crate::federation::FederationError;
 
 /// Seals an envelope for a peer: encodes it and encrypts it with the peer's key.
